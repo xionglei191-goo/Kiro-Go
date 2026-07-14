@@ -5,6 +5,70 @@ import (
 	"testing"
 )
 
+func TestClaudeToKiroAddsSameTurnToolExecutionInstruction(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{{Role: "user", Content: "inspect the repository"}},
+		Tools: []ClaudeTool{{
+			Name:        "exec_command",
+			Description: "Run a command",
+			InputSchema: map[string]interface{}{"type": "object"},
+		}},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	prompt := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(prompt, "invoke the tool in this response") || !strings.Contains(prompt, "Do not end the response with a promise") {
+		t.Fatalf("expected same-turn tool execution instruction, got %q", prompt)
+	}
+	if got := len(payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools); got != 1 {
+		t.Fatalf("expected one exposed tool, got %d", got)
+	}
+}
+
+func TestClaudeToKiroMapsToolChoice(t *testing.T) {
+	tools := []ClaudeTool{
+		{Name: "read_file", InputSchema: map[string]interface{}{"type": "object"}},
+		{Name: "exec_command", InputSchema: map[string]interface{}{"type": "object"}},
+	}
+	build := func(choice interface{}) *KiroPayload {
+		return ClaudeToKiro(&ClaudeRequest{
+			Model:      "claude-sonnet-4.5",
+			Messages:   []ClaudeMessage{{Role: "user", Content: "do it"}},
+			Tools:      tools,
+			ToolChoice: choice,
+		}, false)
+	}
+
+	t.Run("none hides tools", func(t *testing.T) {
+		payload := build(map[string]interface{}{"type": "none"})
+		ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+		if ctx != nil && len(ctx.Tools) != 0 {
+			t.Fatalf("expected no exposed tools, got %d", len(ctx.Tools))
+		}
+	})
+
+	t.Run("any requires a tool", func(t *testing.T) {
+		payload := build(map[string]interface{}{"type": "any"})
+		prompt := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+		if !strings.Contains(prompt, "must invoke at least one provided tool") {
+			t.Fatalf("expected required-tool instruction, got %q", prompt)
+		}
+	})
+
+	t.Run("named choice exposes only selected tool", func(t *testing.T) {
+		payload := build(map[string]interface{}{"type": "tool", "name": "exec_command"})
+		ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+		if ctx == nil || len(ctx.Tools) != 1 || ctx.Tools[0].ToolSpecification.Name != "execCommand" {
+			t.Fatalf("expected only exec_command to be exposed, got %#v", ctx)
+		}
+		prompt := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+		if !strings.Contains(prompt, "must invoke the `execCommand` tool") {
+			t.Fatalf("expected named-tool instruction, got %q", prompt)
+		}
+	})
+}
+
 func TestExtractOpenAIMessageTextStructured(t *testing.T) {
 	content := []interface{}{
 		map[string]interface{}{"type": "text", "text": "alpha"},
@@ -521,7 +585,7 @@ func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 	}
 }
 
-func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
+func TestClaudeOrphanToolResultMixedTextAndImageFlattenedSafely(t *testing.T) {
 	const imgData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
@@ -557,11 +621,14 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	// The tool result is an orphan (no preceding assistant tool call), so per
 	// the flatten rule it must be narrated into Content rather than kept
 	// structured — and its text must survive even though an image is attached.
+	if cur.Images[0].Format != "png" || cur.Images[0].Source.Bytes != imgData {
+		t.Fatalf("unexpected image payload: %+v", cur.Images[0])
+	}
 	if !strings.Contains(cur.Content, "here is the screenshot") {
-		t.Fatalf("expected orphan tool-result text narrated into content, got %q", cur.Content)
+		t.Fatalf("expected orphan tool result text flattened into current content, got %q", cur.Content)
 	}
 	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) != 0 {
-		t.Fatalf("expected orphan tool result to be flattened into text, not kept structured")
+		t.Fatalf("orphan tool result must not remain structured: %#v", cur.UserInputMessageContext.ToolResults)
 	}
 }
 
@@ -631,13 +698,24 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 	// that entry, so count the image on the user entry itself, not via the
 	// structured context.
 	var toolHistImages int
+	var foundNarratedResult bool
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
+		if h.UserInputMessage == nil {
+			continue
+		}
+		if len(h.UserInputMessage.Images) > 0 {
 			toolHistImages += len(h.UserInputMessage.Images)
+			foundNarratedResult = strings.Contains(h.UserInputMessage.Content, toolResultImagePlaceholder)
+			if h.UserInputMessage.UserInputMessageContext != nil && len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+				t.Fatalf("historical tool result must be flattened before sending to Kiro")
+			}
 		}
 	}
 	if toolHistImages != 1 {
 		t.Fatalf("expected tool image carried on the flushed tool-result history entry, got %d", toolHistImages)
+	}
+	if !foundNarratedResult {
+		t.Fatal("expected the historical image tool result to retain its narrated placeholder")
 	}
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
