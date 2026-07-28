@@ -250,6 +250,14 @@ func TestClaudeControllerModelOverride(t *testing.T) {
 			t.Fatalf("controller model = %q, want primary fallback", got)
 		}
 	})
+
+	t.Run("strict retry escalates to primary", func(t *testing.T) {
+		t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
+		controller := buildClaudeToolControllerFallbackPayload(payload, "I will continue.")
+		if got := currentMessageModelID(controller); got != "claude-opus-5" {
+			t.Fatalf("strict retry model = %q, want primary model", got)
+		}
+	})
 }
 
 func TestClaudeControllerPreservesSmallerMaxTokens(t *testing.T) {
@@ -512,6 +520,9 @@ func TestClaudeControllerRetriesOnceWithFallbackBudgetOnContentLength(t *testing
 		usedPayload.InferenceConfig.MaxTokens != claudeControllerFallbackMaxTokens {
 		t.Fatalf("fallback max tokens were not tightened: %#v", usedPayload.InferenceConfig)
 	}
+	if got := currentMessageModelID(usedPayload); got != "claude-opus-5" {
+		t.Fatalf("fallback model = %q, want primary model", got)
+	}
 	if !strings.Contains(
 		usedPayload.ConversationState.CurrentMessage.UserInputMessage.Content,
 		"final controller decision attempt",
@@ -535,7 +546,7 @@ func TestClaudeControllerTokenBudgetTracksControllerModelWindow(t *testing.T) {
 			t.Fatalf("normal Haiku budget = %d, want 150000", got)
 		}
 		if got := claudeControllerInputTokenBudget(payload, true); got != 90_000 {
-			t.Fatalf("fallback Haiku budget = %d, want 90000", got)
+			t.Fatalf("fallback primary-model budget = %d, want 90000", got)
 		}
 	})
 
@@ -741,6 +752,8 @@ func TestClaudeHandlersPreserveExplicitUserConfirmation(t *testing.T) {
 }
 
 func TestClaudeHandlersControllerRetriesUndecidedDecision(t *testing.T) {
+	t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
+
 	for _, stream := range []bool{false, true} {
 		name := "non-stream"
 		if stream {
@@ -778,6 +791,8 @@ func TestClaudeHandlersControllerRetriesUndecidedDecision(t *testing.T) {
 			retry := requests[2]
 			if retry.InferenceConfig == nil ||
 				retry.InferenceConfig.MaxTokens != claudeControllerFallbackMaxTokens ||
+				currentMessageModelID(&requests[1]) != "claude-haiku-4.5" ||
+				currentMessageModelID(&retry) != "claude-opus-5" ||
 				!strings.Contains(
 					retry.ConversationState.CurrentMessage.UserInputMessage.Content,
 					"final controller decision attempt",
@@ -805,6 +820,99 @@ func TestClaudeHandlersControllerRetriesUndecidedDecision(t *testing.T) {
 			}
 			if strings.Contains(body, "I still decline to choose a tool.") {
 				t.Fatalf("controller retry text leaked to the client: %s", body)
+			}
+		})
+	}
+}
+
+func TestClaudeHandlersControllerRetriesUnsupportedWait(t *testing.T) {
+	t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
+
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			recorder, requests := runClaudeControllerHandlerTest(t, stream, func(call int, payload KiroPayload) []byte {
+				switch call {
+				case 1:
+					return awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+						"content":     "I will continue checking the deployment.",
+						"inputTokens": 100,
+					})
+				case 2:
+					return awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+						"toolUseId":   "toolu_invalid_wait",
+						"name":        payload.ControllerWaitToolName,
+						"input":       `{"reason":"uncertain about the next action"}`,
+						"stop":        true,
+						"inputTokens": 120,
+					})
+				case 3:
+					return awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+						"toolUseId":   "toolu_retry_unsupported_wait",
+						"name":        "Bash",
+						"input":       `{"command":"check-deploy"}`,
+						"stop":        true,
+						"inputTokens": 80,
+					})
+				default:
+					return nil
+				}
+			})
+
+			if len(requests) != 3 {
+				t.Fatalf("expected unsupported wait to trigger one strict retry, got %d requests", len(requests))
+			}
+			assertControllerRequestShape(t, requests[1])
+
+			retry := requests[2]
+			if retry.ControllerWaitToolName != "" {
+				t.Fatalf("strict retry retained an internal wait tool name: %q", retry.ControllerWaitToolName)
+			}
+			if currentMessageModelID(&requests[1]) != "claude-haiku-4.5" ||
+				currentMessageModelID(&retry) != "claude-opus-5" {
+				t.Fatalf(
+					"controller did not escalate from Haiku to primary: first=%q retry=%q",
+					currentMessageModelID(&requests[1]),
+					currentMessageModelID(&retry),
+				)
+			}
+			current := retry.ConversationState.CurrentMessage.UserInputMessage
+			if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.Tools) != 2 {
+				t.Fatalf("strict retry must expose one real tool and finish only: %#v", current.UserInputMessageContext)
+			}
+			for _, tool := range current.UserInputMessageContext.Tools {
+				if strings.HasPrefix(tool.ToolSpecification.Name, claudeControllerWaitToolBase) {
+					t.Fatalf("strict retry exposed the internal wait tool: %#v", current.UserInputMessageContext.Tools)
+				}
+			}
+			if !strings.Contains(current.Content, "wait-for-user is not available") {
+				t.Fatalf("strict retry prompt did not reject unsupported waiting: %q", current.Content)
+			}
+
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"stop_reason":"tool_use"`) ||
+				!strings.Contains(body, "toolu_retry_unsupported_wait") {
+				t.Fatalf("strict retry did not recover the real tool call: %s", body)
+			}
+			if strings.Contains(body, "toolu_invalid_wait") ||
+				strings.Contains(body, claudeControllerWaitToolBase) {
+				t.Fatalf("response leaked the rejected wait decision: %s", body)
+			}
+			if stream {
+				if !strings.Contains(body, `"input_tokens":300`) {
+					t.Fatalf("stream did not aggregate controller retry usage: %s", body)
+				}
+			} else {
+				var response ClaudeResponse
+				if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+					t.Fatalf("decode response: %v", err)
+				}
+				if response.StopReason != "tool_use" || response.Usage.InputTokens != 300 {
+					t.Fatalf("unexpected recovered response: %#v", response)
+				}
 			}
 		})
 	}

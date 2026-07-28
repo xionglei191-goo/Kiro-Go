@@ -1544,6 +1544,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 								action = "retry_compact"
 							case claudeControllerRetryUndecided:
 								action = "retry_decision"
+							case claudeControllerRetryUnsupportedWait:
+								action = "retry_unsupported_wait"
 							}
 							logger.Infof(
 								"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true action=%s payload_bytes=%d history_bytes=%d estimated_input_tokens=%d",
@@ -2028,6 +2030,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 								action = "retry_compact"
 							case claudeControllerRetryUndecided:
 								action = "retry_decision"
+							case claudeControllerRetryUnsupportedWait:
+								action = "retry_unsupported_wait"
 							}
 							logger.Infof(
 								"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false action=%s payload_bytes=%d history_bytes=%d estimated_input_tokens=%d",

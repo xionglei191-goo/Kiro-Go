@@ -37,9 +37,10 @@ const (
 	claudeControllerUndecided     claudeControllerOutcome = "undecided"
 	claudeControllerUpstreamError claudeControllerOutcome = "upstream_error"
 
-	claudeControllerNoRetry            claudeControllerRetryReason = ""
-	claudeControllerRetryContentLength claudeControllerRetryReason = "content_length"
-	claudeControllerRetryUndecided     claudeControllerRetryReason = "undecided"
+	claudeControllerNoRetry              claudeControllerRetryReason = ""
+	claudeControllerRetryContentLength   claudeControllerRetryReason = "content_length"
+	claudeControllerRetryUndecided       claudeControllerRetryReason = "undecided"
+	claudeControllerRetryUnsupportedWait claudeControllerRetryReason = "unsupported_wait"
 )
 
 type kiroCallMetrics struct {
@@ -297,6 +298,7 @@ func buildClaudeToolControllerPayload(payload *KiroPayload, assistantContent str
 		tokenBudget,
 		claudeControllerMaxPayloadBytes,
 		false,
+		true,
 	)
 }
 
@@ -308,6 +310,7 @@ func buildClaudeToolControllerFallbackPayload(payload *KiroPayload, assistantCon
 		tokenBudget,
 		claudeControllerFallbackPayloadBytes,
 		true,
+		claudeAssistantRequestsUserInput(assistantContent),
 	)
 }
 
@@ -317,6 +320,9 @@ func claudeControllerInputTokenBudget(payload *KiroPayload, fallback bool) int {
 		primaryModel = currentMessageModelID(payload)
 	}
 	controllerModel := resolveClaudeControllerModel(primaryModel)
+	if fallback {
+		controllerModel = primaryModel
+	}
 	contextWindow := getContextWindowSize(controllerModel)
 
 	percent := claudeControllerTokenBudgetPercent
@@ -338,6 +344,7 @@ func buildClaudeToolControllerPayloadWithBudget(
 	inputTokenLimit int,
 	payloadByteLimit int,
 	strictDecision bool,
+	allowWait bool,
 ) *KiroPayload {
 	if payload == nil || !payload.ClaudeCodeAgent {
 		return nil
@@ -379,13 +386,15 @@ func buildClaudeToolControllerPayloadWithBudget(
 			finishName,
 			"Signal that the user's task is fully complete. Use only when no implementation, command, monitoring, verification, cleanup, or other autonomous work remains.",
 		))
-		waitName := chooseClaudeControllerToolName(controllerTools, claudeControllerWaitToolBase)
-		controllerTools = append(controllerTools, newClaudeControllerTool(
-			waitName,
-			"Signal that progress is blocked on explicit user input, approval, credentials, or a decision that cannot be obtained with the available tools.",
-		))
 		controller.ControllerFinishToolName = finishName
-		controller.ControllerWaitToolName = waitName
+		if allowWait {
+			waitName := chooseClaudeControllerToolName(controllerTools, claudeControllerWaitToolBase)
+			controllerTools = append(controllerTools, newClaudeControllerTool(
+				waitName,
+				"Signal that progress is blocked on explicit user input, approval, credentials, or a decision that cannot be obtained with the available tools.",
+			))
+			controller.ControllerWaitToolName = waitName
+		}
 	}
 
 	assistantContent = strings.TrimSpace(assistantContent)
@@ -405,18 +414,28 @@ func buildClaudeToolControllerPayloadWithBudget(
 		controller.ControllerFinishToolName,
 		controller.ControllerWaitToolName,
 		payload.ClaudeToolChoiceRequired,
+		allowWait,
 	)
 	if strictDecision {
-		basePrompt += `
+		if allowWait {
+			basePrompt += `
 
 This is the final controller decision attempt. A text-only response is invalid.
 Safety remains higher priority than autonomous continuation. If the previous assistant response asks for user confirmation, approval, a choice, credentials, or any other input, invoke the wait-for-user tool.
 Never infer user consent from silence, punctuation-only input, a short acknowledgement, or an unrelated follow-up. When uncertain between continuing and waiting, wait.
 Invoke one or more provided tools now. Do not emit analysis, explanation, or any other text.`
+		} else {
+			basePrompt += `
+
+This is the final controller decision attempt. A text-only response is invalid.
+Safety remains higher priority than autonomous continuation. The previous assistant response did not explicitly request user input, so wait-for-user is not available on this attempt.
+Uncertainty alone is not completion. If autonomous work remains, invoke one or more appropriate real tools. Invoke the finish tool only when the task is fully complete.
+Invoke one or more provided tools now. Do not emit analysis, explanation, or any other text.`
+		}
 	}
 	controller.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: basePrompt,
-		ModelID: resolveClaudeControllerModel(originalCurrent.ModelID),
+		ModelID: claudeControllerAttemptModel(originalCurrent.ModelID, strictDecision),
 		Origin:  originalCurrent.Origin,
 		UserInputMessageContext: &UserInputMessageContext{
 			Tools: controllerTools,
@@ -447,6 +466,13 @@ Invoke one or more provided tools now. Do not emit analysis, explanation, or any
 		payloadByteLimit,
 	)
 	return &controller
+}
+
+func claudeControllerAttemptModel(primaryModel string, strictDecision bool) string {
+	if strictDecision {
+		return primaryModel
+	}
+	return resolveClaudeControllerModel(primaryModel)
 }
 
 type claudeControllerContextAnchors struct {
@@ -699,7 +725,7 @@ func clipClaudeControllerAnchor(text string, tokenBudget int) string {
 	return best
 }
 
-func buildClaudeControllerPrompt(finishName, waitName string, toolChoiceRequired bool) string {
+func buildClaudeControllerPrompt(finishName, waitName string, toolChoiceRequired, allowWait bool) string {
 	if toolChoiceRequired {
 		return `Act as the execution controller for the current Claude Code task.
 Review the original user task, conversation history, tool results, and the previous assistant response.
@@ -708,6 +734,18 @@ The client requires a real tool call in this turn. Invoke one or more appropriat
 Your response is invalid unless it contains at least one provided tool invocation. Do not return prose, analysis, or an empty response.
 Never describe what you intend to do; emit the selected tool call now.`
 	}
+	if !allowWait {
+		return fmt.Sprintf(`Act as the execution controller for the current Claude Code task.
+Review the original user task, conversation history, tool results, and the previous assistant response.
+Safety takes priority over autonomous continuation. Never infer user consent or bypass an explicit pending request for confirmation, approval, a choice, credentials, or other input.
+The previous assistant response contains no explicit request for user input, so waiting is not an available decision on this attempt.
+Make exactly one structured decision now, without emitting text:
+- If autonomous work remains, invoke one or more appropriate real tools now.
+- If the task is fully complete and no command, build, deployment, test, monitoring, verification, or cleanup remains, invoke %q.
+Uncertainty alone is not completion. Do not stop merely because choosing the next tool requires judgment.
+Your response is invalid unless it contains at least one provided tool invocation. Do not return prose, analysis, or an empty response.
+Never signal completion merely because a command or background process is still running. Never describe what you intend to do; emit the selected tool call now.`, finishName)
+	}
 	return fmt.Sprintf(`Act as the execution controller for the current Claude Code task.
 Review the original user task, conversation history, tool results, and the previous assistant response.
 Safety takes priority over autonomous continuation. Never infer user consent from silence, punctuation-only input, a short acknowledgement, or an unrelated follow-up.
@@ -715,7 +753,7 @@ Make exactly one structured decision now, without emitting text:
 - If autonomous work remains, invoke one or more appropriate real tools now.
 - If the task is fully complete and no command, build, deployment, test, monitoring, verification, or cleanup remains, invoke %q.
 - If the previous assistant response asks for confirmation, approval, a choice, credentials, or any other user input, or progress otherwise requires a decision that no available tool can obtain, invoke %q.
-When uncertain between continuing and waiting for the user, wait.
+Use the wait decision only when the conversation contains concrete evidence that user input is required; uncertainty alone is not evidence.
 Your response is invalid unless it contains at least one provided tool invocation. Do not return prose, analysis, or an empty response.
 Never signal completion merely because a command or background process is still running. Never describe what you intend to do; emit the selected tool call now.`, finishName, waitName)
 }
@@ -789,8 +827,12 @@ func callClaudeToolControllerWithFallback(
 		retryReason = claudeControllerRetryContentLength
 	case err == nil:
 		_, outcome := splitClaudeControllerToolUses(controllerPayload, toolUses)
-		if outcome == claudeControllerUndecided {
+		switch {
+		case outcome == claudeControllerUndecided:
 			retryReason = claudeControllerRetryUndecided
+		case outcome == claudeControllerWaitForUser &&
+			!claudeAssistantRequestsUserInput(assistantContent):
+			retryReason = claudeControllerRetryUnsupportedWait
 		}
 	}
 	if retryReason == claudeControllerNoRetry {
