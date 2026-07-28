@@ -26,6 +26,41 @@ func TestClaudeToKiroAddsSameTurnToolExecutionInstruction(t *testing.T) {
 	}
 }
 
+func TestClaudeToKiroEnablesToolControllerOnlyForClaudeCodeAgentRequests(t *testing.T) {
+	claudeCodeSystem := `You are an interactive agent that helps users with software engineering tasks.
+# Doing tasks
+# Using your tools`
+	build := func(system interface{}, choice interface{}) *KiroPayload {
+		return ClaudeToKiro(&ClaudeRequest{
+			Model:      "claude-opus-5",
+			System:     system,
+			ToolChoice: choice,
+			Messages:   []ClaudeMessage{{Role: "user", Content: "inspect the repository"}},
+			Tools: []ClaudeTool{{
+				Name:        "Bash",
+				Description: "Run a command",
+				InputSchema: map[string]interface{}{"type": "object"},
+			}},
+		}, false)
+	}
+
+	if payload := build(claudeCodeSystem, nil); !payload.ClaudeCodeAgent {
+		t.Fatal("expected detected Claude Code tool request to enable the controller")
+	}
+	if payload := build("You are a generic API assistant.", nil); payload.ClaudeCodeAgent {
+		t.Fatal("generic Anthropic request must not enable the controller")
+	}
+	if payload := build(claudeCodeSystem, map[string]interface{}{"type": "none"}); payload.ClaudeCodeAgent {
+		t.Fatal("tool_choice none must not enable the controller")
+	}
+	if payload := build(claudeCodeSystem, map[string]interface{}{"type": "any"}); !payload.ClaudeToolChoiceRequired {
+		t.Fatal("tool_choice any must be preserved for the controller")
+	}
+	if payload := build(claudeCodeSystem, map[string]interface{}{"type": "tool", "name": "Bash"}); !payload.ClaudeToolChoiceRequired {
+		t.Fatal("named tool choice must be preserved for the controller")
+	}
+}
+
 func TestClaudeToKiroMapsToolChoice(t *testing.T) {
 	tools := []ClaudeTool{
 		{Name: "read_file", InputSchema: map[string]interface{}{"type": "object"}},

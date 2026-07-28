@@ -164,6 +164,14 @@ type KiroPayload struct {
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+
+	// Claude tool-controller metadata is local to the proxy. The controller is
+	// enabled only for detected Claude Code agent requests and its synthetic
+	// decision tools are never exposed to the client.
+	ClaudeCodeAgent          bool   `json:"-"`
+	ClaudeToolChoiceRequired bool   `json:"-"`
+	ControllerFinishToolName string `json:"-"`
+	ControllerWaitToolName   string `json:"-"`
 }
 
 type KiroUserInputMessage struct {

@@ -202,6 +202,7 @@ const (
 func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
+	claudeCodeAgent := isClaudeCodeSystemPrompt(extractSystemPrompt(req.System))
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
@@ -329,6 +330,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
+	payload.ClaudeCodeAgent = claudeCodeAgent && len(kiroTools) > 0
+	toolChoiceType, _ := parseClaudeToolChoice(req.ToolChoice)
+	payload.ClaudeToolChoiceRequired = toolChoiceType == "any" || toolChoiceType == "tool"
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()

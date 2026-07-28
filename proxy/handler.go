@@ -967,7 +967,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		firstMetrics := kiroCallMetrics{}
 		secondMetrics := kiroCallMetrics{}
-		autoContinuationAttempted := false
+		controllerAttempted := false
+		controllerOutcome := claudeControllerNotApplicable
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1292,32 +1293,44 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		closeActiveBlock()
 
 		firstOutputContent, _ := extractThinkingFromContent(rawContentBuilder.String())
-		if shouldAutoContinueClaudeToolCall(payload, firstOutputContent, toolUses) {
-			if continuationPayload := buildClaudeToolAutoContinuationPayload(payload, firstOutputContent); continuationPayload != nil {
-				autoContinuationAttempted = true
-				logger.Infof("[ClaudeAutoContinue] model=%s stream=true action=attempt", model)
-				continuationErr := CallKiroAPI(account, continuationPayload, secondMetrics.callback(model, onText, onToolUse))
-				processClaudeText("", false, true)
-				if eventThinkingOpen {
-					sendText("", 3)
-				}
-				closeActiveBlock()
-				if continuationErr != nil {
-					h.handleAccountFailure(account, continuationErr)
-					logger.Warnf("[ClaudeAutoContinue] model=%s stream=true outcome=upstream_error error_type=%s", model, classifyError(continuationErr.Error()))
+		if shouldRunClaudeToolController(payload, toolUses) {
+			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
+				controllerAttempted = true
+				logger.Infof("[ClaudeToolController] conversation=%s model=%s stream=true action=verify", claudeConversationLogID(payload), model)
+				var controllerToolUses []KiroToolUse
+				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(model, nil, func(toolUse KiroToolUse) {
+					controllerToolUses = append(controllerToolUses, toolUse)
+				}))
+				if controllerErr != nil {
+					h.handleAccountFailure(account, controllerErr)
+					controllerOutcome = claudeControllerUpstreamError
+					logger.Warnf(
+						"[ClaudeToolController] conversation=%s model=%s stream=true outcome=%s error_type=%s",
+						claudeConversationLogID(payload),
+						model,
+						controllerOutcome,
+						classifyError(controllerErr.Error()),
+					)
 				} else {
-					outcome := "end_turn"
-					if len(toolUses) > 0 {
-						outcome = "tool_use"
+					var realToolUses []KiroToolUse
+					realToolUses, controllerOutcome = splitClaudeControllerToolUses(controllerPayload, controllerToolUses)
+					for _, toolUse := range realToolUses {
+						onToolUse(toolUse)
 					}
-					logger.Infof("[ClaudeAutoContinue] model=%s stream=true outcome=%s tool_count=%d", model, outcome, len(toolUses))
+					logger.Infof(
+						"[ClaudeToolController] conversation=%s model=%s stream=true outcome=%s tool_count=%d",
+						claudeConversationLogID(payload),
+						model,
+						controllerOutcome,
+						len(realToolUses),
+					)
 				}
 			}
 		}
 
 		firstInputTokens := firstMetrics.effectiveInputTokens(estimatedInputTokens)
 		secondInputTokens := 0
-		if autoContinuationAttempted {
+		if controllerAttempted {
 			secondInputTokens = secondMetrics.effectiveInputTokens(0)
 		}
 		inputTokens := firstInputTokens + secondInputTokens
@@ -1351,16 +1364,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		if stopReason == "end_turn" {
 			logger.Infof(
-				"[ClaudeEndTurn] conversation=%s model=%s stream=true output_chars=%d tools_available=%d auto_continue=%t decision=%s",
+				"[ClaudeEndTurn] conversation=%s model=%s stream=true output_chars=%d tools_available=%d controller_attempted=%t controller_outcome=%s",
 				claudeConversationLogID(payload),
 				model,
 				len([]rune(outputContent)),
-				len(currentKiroTools(payload)),
-				autoContinuationAttempted,
-				claudeToolAutoContinueDecision(payload, outputContent, toolUses),
+				len(currentKiroRealTools(payload)),
+				controllerAttempted,
+				controllerOutcome,
 			)
 		} else {
-			logger.Debugf("[ClaudeStop] model=%s stream=true stop_reason=%s tool_count=%d auto_continue=%t", model, stopReason, len(toolUses), autoContinuationAttempted)
+			logger.Debugf("[ClaudeStop] model=%s stream=true stop_reason=%s tool_count=%d controller_attempted=%t controller_outcome=%s", model, stopReason, len(toolUses), controllerAttempted, controllerOutcome)
 		}
 
 		ensureMessageStart()
@@ -1569,7 +1582,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var toolUses []KiroToolUse
 		firstMetrics := kiroCallMetrics{}
 		secondMetrics := kiroCallMetrics{}
-		autoContinuationAttempted := false
+		controllerAttempted := false
+		controllerOutcome := claudeControllerNotApplicable
 
 		onText := func(text string, isThinking bool) {
 			if isThinking {
@@ -1591,19 +1605,35 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		firstOutputContent, _ := extractThinkingFromContent(content)
-		if shouldAutoContinueClaudeToolCall(payload, firstOutputContent, toolUses) {
-			if continuationPayload := buildClaudeToolAutoContinuationPayload(payload, firstOutputContent); continuationPayload != nil {
-				autoContinuationAttempted = true
-				logger.Infof("[ClaudeAutoContinue] model=%s stream=false action=attempt", model)
-				if continuationErr := CallKiroAPI(account, continuationPayload, secondMetrics.callback(model, onText, onToolUse)); continuationErr != nil {
-					h.handleAccountFailure(account, continuationErr)
-					logger.Warnf("[ClaudeAutoContinue] model=%s stream=false outcome=upstream_error error_type=%s", model, classifyError(continuationErr.Error()))
+		if shouldRunClaudeToolController(payload, toolUses) {
+			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
+				controllerAttempted = true
+				logger.Infof("[ClaudeToolController] conversation=%s model=%s stream=false action=verify", claudeConversationLogID(payload), model)
+				var controllerToolUses []KiroToolUse
+				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(model, nil, func(toolUse KiroToolUse) {
+					controllerToolUses = append(controllerToolUses, toolUse)
+				}))
+				if controllerErr != nil {
+					h.handleAccountFailure(account, controllerErr)
+					controllerOutcome = claudeControllerUpstreamError
+					logger.Warnf(
+						"[ClaudeToolController] conversation=%s model=%s stream=false outcome=%s error_type=%s",
+						claudeConversationLogID(payload),
+						model,
+						controllerOutcome,
+						classifyError(controllerErr.Error()),
+					)
 				} else {
-					outcome := "end_turn"
-					if len(toolUses) > 0 {
-						outcome = "tool_use"
-					}
-					logger.Infof("[ClaudeAutoContinue] model=%s stream=false outcome=%s tool_count=%d", model, outcome, len(toolUses))
+					var realToolUses []KiroToolUse
+					realToolUses, controllerOutcome = splitClaudeControllerToolUses(controllerPayload, controllerToolUses)
+					toolUses = append(toolUses, realToolUses...)
+					logger.Infof(
+						"[ClaudeToolController] conversation=%s model=%s stream=false outcome=%s tool_count=%d",
+						claudeConversationLogID(payload),
+						model,
+						controllerOutcome,
+						len(realToolUses),
+					)
 				}
 			}
 		}
@@ -1620,7 +1650,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		firstInputTokens := firstMetrics.effectiveInputTokens(estimatedInputTokens)
 		secondInputTokens := 0
-		if autoContinuationAttempted {
+		if controllerAttempted {
 			secondInputTokens = secondMetrics.effectiveInputTokens(0)
 		}
 		inputTokens := firstInputTokens + secondInputTokens
@@ -1661,16 +1691,16 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
 		if resp.StopReason == "end_turn" {
 			logger.Infof(
-				"[ClaudeEndTurn] conversation=%s model=%s stream=false output_chars=%d tools_available=%d auto_continue=%t decision=%s",
+				"[ClaudeEndTurn] conversation=%s model=%s stream=false output_chars=%d tools_available=%d controller_attempted=%t controller_outcome=%s",
 				claudeConversationLogID(payload),
 				model,
 				len([]rune(finalContent)),
-				len(currentKiroTools(payload)),
-				autoContinuationAttempted,
-				claudeToolAutoContinueDecision(payload, finalContent, toolUses),
+				len(currentKiroRealTools(payload)),
+				controllerAttempted,
+				controllerOutcome,
 			)
 		} else {
-			logger.Debugf("[ClaudeStop] model=%s stream=false stop_reason=%s tool_count=%d auto_continue=%t", model, resp.StopReason, len(toolUses), autoContinuationAttempted)
+			logger.Debugf("[ClaudeStop] model=%s stream=false stop_reason=%s tool_count=%d controller_attempted=%t controller_outcome=%s", model, resp.StopReason, len(toolUses), controllerAttempted, controllerOutcome)
 		}
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
