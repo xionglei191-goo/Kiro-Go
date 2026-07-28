@@ -14,7 +14,8 @@ const maxClaudeToolIntentRunes = 1200
 
 var (
 	claudeEnglishToolIntentPattern     = regexp.MustCompile(`(?im)(?:^|[\n.!]\s*)(?:[-*]\s*)?(?:(?:okay|sure|all right)[,:]?\s+)?(?:(?:i(?:'ll| will| am going to|'m going to| need to| should)|we(?:'ll| will)|let me|let's|(?:next|first|now),?\s+i(?:'ll| will))\s+)(?:quickly\s+|now\s+)?(?:inspect|check|read|search|look(?:\s+at)?|run|execute|edit|modify|update|implement|fix|test|build|deploy|restart|verify|open|fetch|investigate|analy[sz]e|review|create|add|remove|apply|continue|proceed|use)\b`)
-	claudeEnglishProgressIntentPattern = regexp.MustCompile(`(?im)(?:^|\n)\s*(?:[-*]\s*)?(?:checking|inspecting|reading|searching|running|executing|editing|updating|implementing|testing|building|deploying|restarting|verifying|opening|fetching|investigating|reviewing)\b`)
+	claudeEnglishProgressIntentPattern = regexp.MustCompile(`(?im)(?:^|[\n.!]\s*)(?:[-*]\s*)?(?:checking|inspecting|reading|searching|running|executing|editing|updating|implementing|testing|building|deploying|restarting|verifying|validating|confirming|opening|fetching|investigating|reviewing|monitoring|waiting|polling|watching|tracking|following|emit(?:t)?ing)\b`)
+	claudeEnglishOngoingWorkPattern    = regexp.MustCompile(`(?im)(?:^|[\n.!]\s*)(?:[-*]\s*)?(?:the\s+)?(?:deployment|deploy|build|tests?|checks?|command|process|job|task|script)\s+(?:is|are)\s+(?:still\s+)?(?:running|in progress|pending|waiting|processing)\b`)
 	claudeChineseToolIntentPattern     = regexp.MustCompile(`(?m)(?:^|[\n。！？.!]\s*)(?:[-*]\s*)?(?:好(?:的)?[，,]\s*)?(?:(?:我(?:先|现在|接下来|下一步)?(?:来|会|将|要|需要|准备|继续)?|让我|(?:现在|接下来|下一步|首先|先)(?:我)?(?:来|会|将|要|需要|准备|继续)?)\s*)(?:先|马上|立即|继续|重新|再)?\s*(?:检查|查看|读取|搜索|查找|运行|执行|修改|编辑|更新|实现|修复|测试|构建|编译|部署|重启|验证|打开|获取|定位|分析|审查|创建|添加|删除|应用|处理)`)
 	claudeIntentTailSentenceBoundary   = regexp.MustCompile(`[.!?。！？]\s+`)
 )
@@ -78,6 +79,7 @@ func claudeToolAutoContinueDecision(payload *KiroPayload, content string, toolUs
 
 	if hasTerminalClaudeToolIntent(claudeEnglishToolIntentPattern, content) ||
 		hasTerminalClaudeToolIntent(claudeEnglishProgressIntentPattern, content) ||
+		hasTerminalClaudeToolIntent(claudeEnglishOngoingWorkPattern, content) ||
 		hasTerminalClaudeToolIntent(claudeChineseToolIntentPattern, content) {
 		return "action_intent"
 	}
