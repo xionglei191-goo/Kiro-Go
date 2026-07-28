@@ -145,6 +145,140 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 }
 
+func TestClaudeHandlersUseRealUpstreamCacheBreakdown(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfgFile := t.TempDir() + "/config.json"
+			if err := config.Init(cfgFile); err != nil {
+				t.Fatalf("config.Init: %v", err)
+			}
+			if err := config.AddAccount(config.Account{
+				ID:          "cache-account",
+				Enabled:     true,
+				AccessToken: "cache-token",
+				ProfileArn:  "arn:aws:codewhisperer:profile/cache-account",
+			}); err != nil {
+				t.Fatalf("add account: %v", err)
+			}
+			if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+				t.Fatalf("set preferred endpoint: %v", err)
+			}
+			if err := config.UpdateEndpointFallback(false); err != nil {
+				t.Fatalf("disable endpoint fallback: %v", err)
+			}
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(append(
+					awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{
+						// This estimates 2,000 tokens for a 200K context. The
+						// exact 1,000-token breakdown below must take priority.
+						"contextUsagePercentage": 1,
+					}),
+					awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+						"content": "cache usage verified",
+						"usage": map[string]interface{}{
+							"inputTokens":           1000,
+							"outputTokens":          25,
+							"uncachedInputTokens":   150,
+							"cacheReadInputTokens":  600,
+							"cacheWriteInputTokens": 250,
+						},
+					})...,
+				))
+			}))
+			defer server.Close()
+
+			oldEndpoints := kiroEndpoints
+			kiroEndpoints = []kiroEndpoint{{
+				URL:    server.URL,
+				Origin: "AI_EDITOR",
+				Name:   "test",
+			}}
+			defer func() { kiroEndpoints = oldEndpoints }()
+
+			oldClient := kiroHttpStore.Load()
+			kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+			defer kiroHttpStore.Store(oldClient)
+
+			p := accountpool.GetPool()
+			p.Reload()
+			upstreamUsage := newUpstreamUsageTracker()
+			h := &Handler{
+				pool:          p,
+				promptCache:   newPromptCacheTracker(defaultPromptCacheTTL),
+				upstreamUsage: upstreamUsage,
+			}
+
+			payload := &KiroPayload{}
+			payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+				Content: "hello",
+				ModelID: "claude-sonnet-4.5",
+				Origin:  "AI_EDITOR",
+			}
+
+			rec := httptest.NewRecorder()
+			if stream {
+				h.handleClaudeStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+			} else {
+				h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+
+			var usage ClaudeUsage
+			if stream {
+				for _, line := range strings.Split(rec.Body.String(), "\n") {
+					if !strings.HasPrefix(line, "data: ") {
+						continue
+					}
+					var event struct {
+						Type  string      `json:"type"`
+						Usage ClaudeUsage `json:"usage"`
+					}
+					if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+						t.Fatalf("decode SSE event: %v", err)
+					}
+					if event.Type == "message_delta" {
+						usage = event.Usage
+						break
+					}
+				}
+			} else {
+				var response ClaudeResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+					t.Fatalf("decode response: %v", err)
+				}
+				usage = response.Usage
+			}
+
+			if usage.InputTokens != 150 ||
+				usage.CacheCreationInputTokens != 250 ||
+				usage.CacheReadInputTokens != 600 {
+				t.Fatalf("expected real upstream cache usage, got %+v; body=%s", usage, rec.Body.String())
+			}
+			if usage.CacheCreation == nil ||
+				usage.CacheCreation.Ephemeral5mInputTokens != 250 ||
+				usage.CacheCreation.Ephemeral1hInputTokens != 0 {
+				t.Fatalf("unexpected cache creation breakdown: %+v", usage.CacheCreation)
+			}
+
+			stats := upstreamUsage.Stats()
+			if stats.Calls != 1 ||
+				stats.CallsWithBreakdown != 1 ||
+				stats.CacheHitCalls != 1 ||
+				stats.CacheReadInputTokens != 600 {
+				t.Fatalf("unexpected upstream cache stats: %+v", stats)
+			}
+		})
+	}
+}
+
 func TestThinkingSourceTagFirst(t *testing.T) {
 	var source thinkingStreamSource
 
@@ -522,11 +656,19 @@ func TestStatsIncludesCacheMetrics(t *testing.T) {
 	tr.Compute("acct", profile) // miss (empty cache)
 	tr.Update("acct", profile)
 	tr.Compute("acct", profile) // hit
+	upstream := newUpstreamUsageTracker()
+	upstream.Record(KiroTokenUsage{
+		InputTokens:             2000,
+		UncachedInputTokens:     500,
+		CacheReadInputTokens:    1500,
+		InputBreakdownAvailable: true,
+	})
 
 	h := &Handler{
-		pool:        p,
-		promptCache: tr,
-		startTime:   time.Now().Unix(),
+		pool:          p,
+		promptCache:   tr,
+		upstreamUsage: upstream,
+		startTime:     time.Now().Unix(),
 	}
 
 	rec := httptest.NewRecorder()
@@ -545,5 +687,15 @@ func TestStatsIncludesCacheMetrics(t *testing.T) {
 	}
 	if cache["misses"].(float64) != 1 {
 		t.Fatalf("expected 1 miss, got %v", cache["misses"])
+	}
+	upstreamCache, ok := got["upstreamCache"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected an upstreamCache object, got %#v", got)
+	}
+	if upstreamCache["callsWithBreakdown"].(float64) != 1 {
+		t.Fatalf("expected one upstream breakdown, got %#v", upstreamCache)
+	}
+	if upstreamCache["cacheReadInputTokens"].(float64) != 1500 {
+		t.Fatalf("expected real upstream cache-read tokens, got %#v", upstreamCache)
 	}
 }

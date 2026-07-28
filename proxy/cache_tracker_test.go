@@ -168,6 +168,37 @@ func TestPromptCacheStableWhenBillingHeaderAppearsOrDisappears(t *testing.T) {
 	}
 }
 
+func TestPromptCachePreservesStableTextBesideBillingHeader(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	build := func(header string) *promptCacheProfile {
+		req := &ClaudeRequest{
+			Model: "claude-sonnet-4-6",
+			System: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": header + "\nStable system instructions that must remain fingerprinted.",
+					"cache_control": map[string]interface{}{
+						"type": "ephemeral",
+					},
+				},
+			},
+		}
+		return tracker.BuildClaudeProfile(req, 2000)
+	}
+
+	first := build("x-anthropic-billing-header: cc_version=1; cch=first;")
+	second := build("x-anthropic-billing-header: cc_version=2; cch=second;")
+	if first == nil || second == nil || len(first.Breakpoints) != 1 || len(second.Breakpoints) != 1 {
+		t.Fatalf("expected one stable cache breakpoint: first=%+v second=%+v", first, second)
+	}
+	if first.Breakpoints[0].Fingerprint != second.Breakpoints[0].Fingerprint {
+		t.Fatal("volatile billing header changed the stable cache fingerprint")
+	}
+	if first.Breakpoints[0].CumulativeTokens <= 0 {
+		t.Fatal("stable instructions were dropped with the billing header")
+	}
+}
+
 func TestCanonicalCacheValueIgnoresPositionKeys(t *testing.T) {
 	first := canonicalizeCacheValue(stripCachePositionKeys(map[string]interface{}{
 		"kind":         "system",

@@ -28,6 +28,8 @@ type kiroCallMetrics struct {
 	inputTokens     int
 	realInputTokens int
 	credits         float64
+	usage           KiroTokenUsage
+	upstreamUsage   *upstreamUsageTracker
 }
 
 func (m *kiroCallMetrics) callback(model string, onText func(string, bool), onToolUse func(KiroToolUse)) *KiroStreamCallback {
@@ -36,6 +38,10 @@ func (m *kiroCallMetrics) callback(model string, onText func(string, bool), onTo
 		OnToolUse: onToolUse,
 		OnComplete: func(inputTokens, _ int) {
 			m.inputTokens = inputTokens
+		},
+		OnUsage: func(usage KiroTokenUsage) {
+			m.usage = usage
+			m.upstreamUsage.Record(usage)
 		},
 		OnCredits: func(credits float64) {
 			m.credits += credits
@@ -47,6 +53,9 @@ func (m *kiroCallMetrics) callback(model string, onText func(string, bool), onTo
 }
 
 func (m kiroCallMetrics) effectiveInputTokens(fallback int) int {
+	if m.usage.InputBreakdownAvailable && m.usage.InputTokens > 0 {
+		return m.usage.InputTokens
+	}
 	if m.realInputTokens > 0 {
 		return m.realInputTokens
 	}

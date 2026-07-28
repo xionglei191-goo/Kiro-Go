@@ -573,11 +573,21 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	blockValue := wrapper["block"]
 	ttl := normalizePromptCacheTTL(extractPromptCacheTTL(blockValue))
 
-	// Drop volatile billing metadata from the cache fingerprint. Claude Code's
-	// x-anthropic-billing-header can drift, appear, or disappear across
-	// otherwise identical requests, and it does not change model semantics.
-	if isAnthropicBillingHeaderBlock(blockValue) {
+	// Remove only the volatile billing-header lines. A system block may contain
+	// both the header and stable instructions; dropping the whole block would
+	// make the local cache profile diverge from the sanitized outbound prompt.
+	normalizedBlock, keep, changed := normalizeCacheTextBlock(blockValue)
+	if !keep {
 		return
+	}
+	if changed {
+		clonedWrapper := make(map[string]interface{}, len(wrapper))
+		for key, value := range wrapper {
+			clonedWrapper[key] = value
+		}
+		clonedWrapper["block"] = normalizedBlock
+		wrapper = clonedWrapper
+		blockValue = normalizedBlock
 	}
 
 	fingerprintValue := stripCachePositionKeys(wrapper)
@@ -590,6 +600,36 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	})
 }
 
+func normalizeCacheTextBlock(value interface{}) (interface{}, bool, bool) {
+	blockMap, ok := value.(map[string]interface{})
+	if !ok {
+		return value, true, false
+	}
+
+	if blockType, ok := blockMap["type"].(string); ok && blockType != "" && blockType != "text" {
+		return value, true, false
+	}
+	text, ok := blockMap["text"].(string)
+	if !ok {
+		return value, true, false
+	}
+
+	cleaned := stripVolatileClaudeSystemLines(text)
+	if cleaned == text {
+		return value, true, false
+	}
+	if cleaned == "" {
+		return nil, false, true
+	}
+
+	cloned := make(map[string]interface{}, len(blockMap))
+	for key, item := range blockMap {
+		cloned[key] = item
+	}
+	cloned["text"] = cleaned
+	return cloned, true, true
+}
+
 func stripCachePositionKeys(value map[string]interface{}) map[string]interface{} {
 	cloned := make(map[string]interface{}, len(value))
 	for key, item := range value {
@@ -599,26 +639,6 @@ func stripCachePositionKeys(value map[string]interface{}) map[string]interface{}
 		cloned[key] = item
 	}
 	return cloned
-}
-
-func isAnthropicBillingHeaderBlock(value interface{}) bool {
-	blockMap, ok := value.(map[string]interface{})
-	if !ok {
-		return false
-	}
-
-	// Only normalize text blocks (or blocks without an explicit type but containing text).
-	if t, ok := blockMap["type"].(string); ok && t != "" && t != "text" {
-		return false
-	}
-
-	text, ok := blockMap["text"].(string)
-	if !ok {
-		return false
-	}
-
-	trimmed := strings.TrimLeft(text, " \t\r\n")
-	return strings.HasPrefix(strings.ToLower(trimmed), "x-anthropic-billing-header:")
 }
 
 func extractPromptCacheTTL(value interface{}) time.Duration {

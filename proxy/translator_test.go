@@ -346,6 +346,53 @@ func TestOpenAIConversationIDRandomForSyntheticAnchor(t *testing.T) {
 	}
 }
 
+func TestStripVolatileClaudeSystemLinesPreservesStableInstructions(t *testing.T) {
+	prompt := strings.Join([]string{
+		"Stable instruction one.",
+		"x-anthropic-billing-header: cc_version=2.1.87; cch=volatile;",
+		"",
+		"Stable instruction two.",
+	}, "\n")
+
+	got := stripVolatileClaudeSystemLines(prompt)
+	if strings.Contains(strings.ToLower(got), "x-anthropic-billing-header:") {
+		t.Fatalf("billing header was not removed: %q", got)
+	}
+	if !strings.Contains(got, "Stable instruction one.") ||
+		!strings.Contains(got, "Stable instruction two.") {
+		t.Fatalf("stable instructions were removed: %q", got)
+	}
+}
+
+func TestStripVolatileClaudeSystemLinesLeavesOtherPromptsByteStable(t *testing.T) {
+	prompt := "  Stable instruction.\n\n\nKeep deliberate spacing.  "
+	if got := stripVolatileClaudeSystemLines(prompt); got != prompt {
+		t.Fatalf("prompt without billing metadata changed: %q", got)
+	}
+}
+
+func TestClaudeConversationIDIgnoresVolatileBillingHeader(t *testing.T) {
+	build := func(header string) string {
+		req := &ClaudeRequest{
+			Model: "claude-opus-4-6",
+			System: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": "Stable system instruction.\n" + header,
+				},
+			},
+			Messages: []ClaudeMessage{{Role: "user", Content: "stable anchor"}},
+		}
+		return ClaudeToKiro(req, false).ConversationState.ConversationID
+	}
+
+	first := build("x-anthropic-billing-header: cc_version=1; cch=first;")
+	second := build("x-anthropic-billing-header: cc_version=2; cch=second;")
+	if first == "" || second == "" || first != second {
+		t.Fatalf("volatile billing metadata changed conversation ID: %q vs %q", first, second)
+	}
+}
+
 func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-sonnet-4.5",

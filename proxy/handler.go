@@ -56,6 +56,7 @@ type Handler struct {
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
+	upstreamUsage   *upstreamUsageTracker
 	tokenRefreshMu  sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
@@ -247,6 +248,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		upstreamUsage:   newUpstreamUsageTracker(),
 	}
 	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
 	h.promptCache.Load(cachePath)
@@ -504,6 +506,7 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
 		"cache":           h.promptCache.Stats(),
+		"upstreamCache":   h.upstreamUsage.Stats(),
 		// Customer-safe latency distribution (no account identities): with session
 		// affinity on, warm accounts pull the mean/min down over time.
 		"dispatchLatency": h.pool.LatencyAggregate(),
@@ -965,8 +968,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 		messageStartUsage = cacheUsage
 
-		firstMetrics := kiroCallMetrics{}
-		secondMetrics := kiroCallMetrics{}
+		firstMetrics := kiroCallMetrics{upstreamUsage: h.upstreamUsage}
+		secondMetrics := kiroCallMetrics{upstreamUsage: h.upstreamUsage}
 		controllerAttempted := false
 		controllerOutcome := claudeControllerNotApplicable
 		structuredOutputRequested := payload != nil && payload.StructuredOutputToolName != ""
@@ -1388,6 +1391,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if cacheProfile != nil && firstMetrics.realInputTokens > 0 {
 			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, firstInputTokens)
 		}
+		actualCacheUsage := false
+		if upstreamCacheUsage, ok := actualUpstreamPromptCacheUsage(inputTokens, firstMetrics, secondMetrics); ok {
+			cacheUsage = upstreamCacheUsage
+			actualCacheUsage = true
+		}
+		includeCacheUsage := cacheProfile != nil || actualCacheUsage
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if structuredOutputContent != "" && len(toolUses) == 0 {
@@ -1434,7 +1443,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, includeCacheUsage),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1632,8 +1641,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var content string
 		var thinkingContent string
 		var toolUses []KiroToolUse
-		firstMetrics := kiroCallMetrics{}
-		secondMetrics := kiroCallMetrics{}
+		firstMetrics := kiroCallMetrics{upstreamUsage: h.upstreamUsage}
+		secondMetrics := kiroCallMetrics{upstreamUsage: h.upstreamUsage}
 		controllerAttempted := false
 		controllerOutcome := claudeControllerNotApplicable
 		structuredOutputRequested := payload != nil && payload.StructuredOutputToolName != ""
@@ -1748,6 +1757,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if cacheProfile != nil && firstMetrics.realInputTokens > 0 {
 			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, firstInputTokens)
 		}
+		actualCacheUsage := false
+		if upstreamCacheUsage, ok := actualUpstreamPromptCacheUsage(inputTokens, firstMetrics, secondMetrics); ok {
+			cacheUsage = upstreamCacheUsage
+			actualCacheUsage = true
+		}
+		includeCacheUsage := cacheProfile != nil || actualCacheUsage
 		outputTokens := estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -1792,7 +1807,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
-		if cacheProfile != nil {
+		if includeCacheUsage {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
 				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
 				Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,

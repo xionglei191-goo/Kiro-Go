@@ -393,6 +393,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 	systemPrompt := extractSystemPrompt(system)
+	systemPrompt = stripVolatileClaudeSystemLines(systemPrompt)
 	systemPrompt = applyPromptFilters(systemPrompt)
 	if !thinking {
 		return systemPrompt
@@ -401,6 +402,32 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 		return ThinkingModePrompt
 	}
 	return ThinkingModePrompt + "\n\n" + systemPrompt
+}
+
+// stripVolatileClaudeSystemLines removes request-accounting metadata that
+// Claude Code changes between otherwise identical turns. It carries no model
+// instruction semantics, but leaving it in the outbound Kiro prompt makes a
+// large stable prefix byte-different and defeats any upstream prefix cache.
+func stripVolatileClaudeSystemLines(prompt string) string {
+	if prompt == "" {
+		return ""
+	}
+
+	lines := strings.Split(prompt, "\n")
+	out := make([]string, 0, len(lines))
+	removed := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(trimmed), "x-anthropic-billing-header:") {
+			removed = true
+			continue
+		}
+		out = append(out, line)
+	}
+	if !removed {
+		return prompt
+	}
+	return strings.TrimSpace(collapseBlankLines(strings.Join(out, "\n")))
 }
 
 const claudeToolExecutionPrompt = `When the current task requires one of the provided tools, invoke the tool in this response. Do not end the response with a promise or statement of intent to inspect, search, run, edit, or otherwise use a tool later. Emit the tool call now, then continue after its result is returned.`

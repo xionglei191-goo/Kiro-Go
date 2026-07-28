@@ -246,9 +246,25 @@ type KiroStreamCallback struct {
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
 	OnComplete     func(inputTokens, outputTokens int)
+	OnUsage        func(usage KiroTokenUsage)
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+}
+
+// KiroTokenUsage preserves the upstream input-token breakdown when Kiro
+// provides it. InputTokens is the upstream total used by existing accounting;
+// the breakdown fields remain zero when the upstream omits them.
+type KiroTokenUsage struct {
+	InputTokens              int
+	OutputTokens             int
+	UncachedInputTokens      int
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
+	InputBreakdownAvailable  bool
+
+	inputTokensReported         bool
+	uncachedInputTokensReported bool
 }
 
 // ==================== API Call ====================
@@ -471,7 +487,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	}
 
 	// Read directly without bufio to avoid buffering latency in streaming responses.
-	var inputTokens, outputTokens int
+	var usage KiroTokenUsage
 	var totalCredits float64
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
@@ -528,7 +544,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			continue
 		}
 
-		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		updateKiroTokenUsageFromEvent(event, &usage)
 
 		// Dispatch by event type.
 		switch eventType {
@@ -569,63 +585,105 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		callback.OnCredits(totalCredits)
 	}
 
+	if callback.OnUsage != nil {
+		callback.OnUsage(usage)
+	}
 	if callback.OnComplete != nil {
-		callback.OnComplete(inputTokens, outputTokens)
+		callback.OnComplete(usage.InputTokens, usage.OutputTokens)
 	}
 	return nil
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
+	usage := KiroTokenUsage{
+		InputTokens:         currentInputTokens,
+		OutputTokens:        currentOutputTokens,
+		inputTokensReported: currentInputTokens > 0,
+	}
+	updateKiroTokenUsageFromEvent(event, &usage)
+	return usage.InputTokens, usage.OutputTokens
+}
+
+func updateKiroTokenUsageFromEvent(event map[string]interface{}, usage *KiroTokenUsage) {
+	if usage == nil {
+		return
+	}
+
 	candidates := []map[string]interface{}{event}
 	collectUsageMaps(event, &candidates)
 
-	inputTokens := currentInputTokens
-	outputTokens := currentOutputTokens
-
-	for _, usage := range candidates {
-		if usage == nil {
+	for _, candidate := range candidates {
+		if candidate == nil {
 			continue
 		}
 
-		if v, ok := readTokenNumber(usage,
+		if v, ok := readTokenNumber(candidate,
 			"outputTokens", "completionTokens", "totalOutputTokens",
 			"output_tokens", "completion_tokens", "total_output_tokens",
 		); ok {
-			outputTokens = v
+			usage.OutputTokens = v
 		}
 
-		if v, ok := readTokenNumber(usage,
+		if v, ok := readTokenNumber(candidate,
 			"inputTokens", "promptTokens", "totalInputTokens",
 			"input_tokens", "prompt_tokens", "total_input_tokens",
 		); ok {
-			inputTokens = v
-			continue
+			usage.InputTokens = v
+			usage.inputTokensReported = true
 		}
 
-		uncached, _ := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens")
-		cacheRead, _ := readTokenNumber(usage, "cacheReadInputTokens", "cache_read_input_tokens")
-		cacheWrite, _ := readTokenNumber(usage, "cacheWriteInputTokens", "cache_write_input_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens")
-		if uncached+cacheRead+cacheWrite > 0 {
-			inputTokens = uncached + cacheRead + cacheWrite
-			continue
+		uncached, hasUncached := readTokenNumber(candidate, "uncachedInputTokens", "uncached_input_tokens")
+		cacheRead, hasCacheRead := readTokenNumber(candidate, "cacheReadInputTokens", "cache_read_input_tokens")
+		cacheWrite, hasCacheWrite := readTokenNumber(candidate,
+			"cacheWriteInputTokens", "cache_write_input_tokens",
+			"cacheCreationInputTokens", "cache_creation_input_tokens",
+		)
+		if hasUncached || hasCacheRead || hasCacheWrite {
+			usage.InputBreakdownAvailable = true
+			if hasUncached {
+				usage.UncachedInputTokens = uncached
+				usage.uncachedInputTokensReported = true
+			}
+			if hasCacheRead {
+				usage.CacheReadInputTokens = cacheRead
+			}
+			if hasCacheWrite {
+				usage.CacheCreationInputTokens = cacheWrite
+			}
 		}
 
-		total, ok := readTokenNumber(usage, "totalTokens", "total_tokens")
-		if ok && total > 0 {
-			candidateOutput := outputTokens
-			if v, vok := readTokenNumber(usage,
+		total, ok := readTokenNumber(candidate, "totalTokens", "total_tokens")
+		if ok && total > 0 && !usage.inputTokensReported {
+			candidateOutput := usage.OutputTokens
+			if v, vok := readTokenNumber(candidate,
 				"outputTokens", "completionTokens", "totalOutputTokens",
 				"output_tokens", "completion_tokens", "total_output_tokens",
 			); vok {
 				candidateOutput = v
 			}
 			if total-candidateOutput > 0 {
-				inputTokens = total - candidateOutput
+				usage.InputTokens = total - candidateOutput
 			}
 		}
 	}
 
-	return inputTokens, outputTokens
+	if !usage.InputBreakdownAvailable {
+		return
+	}
+
+	breakdownTotal := usage.UncachedInputTokens +
+		usage.CacheReadInputTokens +
+		usage.CacheCreationInputTokens
+	if !usage.inputTokensReported && breakdownTotal > 0 {
+		usage.InputTokens = breakdownTotal
+		return
+	}
+	if !usage.uncachedInputTokensReported && usage.InputTokens > 0 {
+		usage.UncachedInputTokens = maxInt(
+			usage.InputTokens-usage.CacheReadInputTokens-usage.CacheCreationInputTokens,
+			0,
+		)
+	}
 }
 
 // getContextWindowSize returns the context window size (in tokens) for a model.

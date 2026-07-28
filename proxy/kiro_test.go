@@ -108,6 +108,66 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 	}
 }
 
+func TestParseEventStreamPreservesUpstreamCacheBreakdown(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+		"content": "hello",
+		"usage": map[string]interface{}{
+			"inputTokens":           1000,
+			"outputTokens":          25,
+			"cacheReadInputTokens":  600,
+			"cacheWriteInputTokens": 250,
+			"uncachedInputTokens":   150,
+		},
+	}))
+
+	var got KiroTokenUsage
+	var completedInput, completedOutput int
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnUsage: func(usage KiroTokenUsage) {
+			got = usage
+		},
+		OnComplete: func(inputTokens, outputTokens int) {
+			completedInput = inputTokens
+			completedOutput = outputTokens
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if !got.InputBreakdownAvailable {
+		t.Fatal("expected upstream input breakdown to be marked available")
+	}
+	if got.InputTokens != 1000 || got.OutputTokens != 25 {
+		t.Fatalf("unexpected totals: %+v", got)
+	}
+	if got.UncachedInputTokens != 150 ||
+		got.CacheReadInputTokens != 600 ||
+		got.CacheCreationInputTokens != 250 {
+		t.Fatalf("unexpected cache breakdown: %+v", got)
+	}
+	if completedInput != 1000 || completedOutput != 25 {
+		t.Fatalf("legacy completion callback changed: input=%d output=%d", completedInput, completedOutput)
+	}
+}
+
+func TestUpdateKiroTokenUsageDerivesMissingUncachedTokens(t *testing.T) {
+	var usage KiroTokenUsage
+	updateKiroTokenUsageFromEvent(map[string]interface{}{
+		"usage": map[string]interface{}{
+			"input_tokens":                1000,
+			"cache_read_input_tokens":     700,
+			"cache_creation_input_tokens": 200,
+		},
+	}, &usage)
+
+	if !usage.InputBreakdownAvailable {
+		t.Fatal("expected cache fields to mark the breakdown available")
+	}
+	if usage.UncachedInputTokens != 100 {
+		t.Fatalf("expected uncached input to be derived as 100, got %+v", usage)
+	}
+}
+
 func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 	var toolUses []KiroToolUse
 	current := handleToolUseEvent(map[string]interface{}{
