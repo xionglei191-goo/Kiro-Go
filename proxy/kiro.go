@@ -172,6 +172,7 @@ type KiroPayload struct {
 	ClaudeToolChoiceRequired bool   `json:"-"`
 	ControllerFinishToolName string `json:"-"`
 	ControllerWaitToolName   string `json:"-"`
+	StructuredOutputToolName string `json:"-"`
 }
 
 type KiroUserInputMessage struct {

@@ -455,8 +455,9 @@ func runClaudeControllerHandlerTest(
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
+	accountID := "controller-account-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
 	if err := config.AddAccount(config.Account{
-		ID:          "controller-account",
+		ID:          accountID,
 		Enabled:     true,
 		AccessToken: "controller-token",
 		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",

@@ -59,6 +59,7 @@ func (m kiroCallMetrics) effectiveInputTokens(fallback int) int {
 func shouldRunClaudeToolController(payload *KiroPayload, toolUses []KiroToolUse) bool {
 	return payload != nil &&
 		payload.ClaudeCodeAgent &&
+		payload.StructuredOutputToolName == "" &&
 		len(toolUses) == 0 &&
 		len(currentKiroRealTools(payload)) > 0
 }
@@ -82,7 +83,9 @@ func currentKiroRealTools(payload *KiroPayload) []KiroToolWrapper {
 	realTools := make([]KiroToolWrapper, 0, len(tools))
 	for _, tool := range tools {
 		name := tool.ToolSpecification.Name
-		if name == payload.ControllerFinishToolName || name == payload.ControllerWaitToolName {
+		if name == payload.ControllerFinishToolName ||
+			name == payload.ControllerWaitToolName ||
+			name == payload.StructuredOutputToolName {
 			continue
 		}
 		realTools = append(realTools, tool)
@@ -105,6 +108,7 @@ func buildClaudeToolControllerPayload(payload *KiroPayload, assistantContent str
 	}
 	controller.ClaudeCodeAgent = payload.ClaudeCodeAgent
 	controller.ClaudeToolChoiceRequired = payload.ClaudeToolChoiceRequired
+	controller.StructuredOutputToolName = payload.StructuredOutputToolName
 	controller.ToolNameMap = make(map[string]string, len(payload.ToolNameMap))
 	for sanitized, original := range payload.ToolNameMap {
 		controller.ToolNameMap[sanitized] = original

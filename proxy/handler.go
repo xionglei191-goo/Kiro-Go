@@ -969,6 +969,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		secondMetrics := kiroCallMetrics{}
 		controllerAttempted := false
 		controllerOutcome := claudeControllerNotApplicable
+		structuredOutputRequested := payload != nil && payload.StructuredOutputToolName != ""
+		structuredRetryAttempted := false
+		structuredOutputContent := ""
+		bufferedContentFlushed := false
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1226,9 +1230,22 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			} else {
 				rawContentBuilder.WriteString(text)
 			}
+			if structuredOutputRequested {
+				return
+			}
 			processClaudeText(text, isThinking, false)
 		}
 		onToolUse := func(tu KiroToolUse) {
+			if output, consumed := consumeClaudeStructuredOutputTool(payload, tu); consumed {
+				if output != "" {
+					structuredOutputContent = output
+				}
+				return
+			}
+			if structuredOutputRequested && !bufferedContentFlushed {
+				processClaudeText(rawContentBuilder.String(), false, true)
+				bufferedContentFlushed = true
+			}
 			processClaudeText("", false, true)
 			rawContentBuilder.WriteString(tu.Name)
 			if b, err := json.Marshal(tu.Input); err == nil {
@@ -1286,13 +1303,43 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			return
 		}
 
-		processClaudeText("", false, true)
-		if eventThinkingOpen {
-			sendText("", 3)
+		if !structuredOutputRequested || bufferedContentFlushed {
+			processClaudeText("", false, true)
+			if eventThinkingOpen {
+				sendText("", 3)
+			}
+			closeActiveBlock()
 		}
-		closeActiveBlock()
 
 		firstOutputContent, _ := extractThinkingFromContent(rawContentBuilder.String())
+		if structuredOutputRequested && structuredOutputContent == "" && len(toolUses) == 0 {
+			structuredRetryAttempted = true
+			logger.Infof("[ClaudeStructuredOutput] conversation=%s model=%s stream=true action=retry", claudeConversationLogID(payload), model)
+			retryOutput, retryErr := callClaudeStructuredOutputRetry(account, payload, firstOutputContent, model, &secondMetrics)
+			if retryErr != nil {
+				logger.Warnf(
+					"[ClaudeStructuredOutput] conversation=%s model=%s stream=true outcome=failed error=%v",
+					claudeConversationLogID(payload),
+					model,
+					retryErr,
+				)
+				if normalized, ok := normalizeClaudeStructuredJSON(firstOutputContent); ok {
+					structuredOutputContent = normalized
+				} else if coerced, ok := coerceClaudeGoalVerifierOutput(structuredOutputSchemaFromPayload(payload), firstOutputContent); ok {
+					structuredOutputContent = coerced
+				}
+			} else {
+				structuredOutputContent = retryOutput
+				logger.Infof("[ClaudeStructuredOutput] conversation=%s model=%s stream=true outcome=success", claudeConversationLogID(payload), model)
+			}
+		}
+		if structuredOutputContent != "" && len(toolUses) == 0 {
+			sendText(structuredOutputContent, 0)
+			closeActiveBlock()
+		} else if structuredOutputRequested && !bufferedContentFlushed && len(toolUses) == 0 {
+			processClaudeText(rawContentBuilder.String(), false, true)
+			closeActiveBlock()
+		}
 		if shouldRunClaudeToolController(payload, toolUses) {
 			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
@@ -1330,7 +1377,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		firstInputTokens := firstMetrics.effectiveInputTokens(estimatedInputTokens)
 		secondInputTokens := 0
-		if controllerAttempted {
+		if controllerAttempted || structuredRetryAttempted {
 			secondInputTokens = secondMetrics.effectiveInputTokens(0)
 		}
 		inputTokens := firstInputTokens + secondInputTokens
@@ -1343,6 +1390,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
+		if structuredOutputContent != "" && len(toolUses) == 0 {
+			outputContent = structuredOutputContent
+			extractedReasoning = ""
+			thinkingOutput = ""
+		}
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
 			thinkingOutput = extractedReasoning
 		}
@@ -1584,6 +1636,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		secondMetrics := kiroCallMetrics{}
 		controllerAttempted := false
 		controllerOutcome := claudeControllerNotApplicable
+		structuredOutputRequested := payload != nil && payload.StructuredOutputToolName != ""
+		structuredRetryAttempted := false
+		structuredOutputContent := ""
 
 		onText := func(text string, isThinking bool) {
 			if isThinking {
@@ -1593,6 +1648,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 		onToolUse := func(tu KiroToolUse) {
+			if output, consumed := consumeClaudeStructuredOutputTool(payload, tu); consumed {
+				if output != "" {
+					structuredOutputContent = output
+				}
+				return
+			}
 			toolUses = append(toolUses, tu)
 		}
 
@@ -1605,6 +1666,27 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		firstOutputContent, _ := extractThinkingFromContent(content)
+		if structuredOutputRequested && structuredOutputContent == "" && len(toolUses) == 0 {
+			structuredRetryAttempted = true
+			logger.Infof("[ClaudeStructuredOutput] conversation=%s model=%s stream=false action=retry", claudeConversationLogID(payload), model)
+			retryOutput, retryErr := callClaudeStructuredOutputRetry(account, payload, firstOutputContent, model, &secondMetrics)
+			if retryErr != nil {
+				logger.Warnf(
+					"[ClaudeStructuredOutput] conversation=%s model=%s stream=false outcome=failed error=%v",
+					claudeConversationLogID(payload),
+					model,
+					retryErr,
+				)
+				if normalized, ok := normalizeClaudeStructuredJSON(firstOutputContent); ok {
+					structuredOutputContent = normalized
+				} else if coerced, ok := coerceClaudeGoalVerifierOutput(structuredOutputSchemaFromPayload(payload), firstOutputContent); ok {
+					structuredOutputContent = coerced
+				}
+			} else {
+				structuredOutputContent = retryOutput
+				logger.Infof("[ClaudeStructuredOutput] conversation=%s model=%s stream=false outcome=success", claudeConversationLogID(payload), model)
+			}
+		}
 		if shouldRunClaudeToolController(payload, toolUses) {
 			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
@@ -1641,6 +1723,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		thinkingFormat := thinkingOpts.Format
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
 		rawThinkingContent := thinkingContent
+		if structuredOutputContent != "" && len(toolUses) == 0 {
+			finalContent = structuredOutputContent
+			extractedReasoning = ""
+			rawThinkingContent = ""
+		}
 		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
 			rawThinkingContent = extractedReasoning
 		}
@@ -1650,7 +1737,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		firstInputTokens := firstMetrics.effectiveInputTokens(estimatedInputTokens)
 		secondInputTokens := 0
-		if controllerAttempted {
+		if controllerAttempted || structuredRetryAttempted {
 			secondInputTokens = secondMetrics.effectiveInputTokens(0)
 		}
 		inputTokens := firstInputTokens + secondInputTokens

@@ -282,14 +282,19 @@ var (
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
 	cfgPath = path
-	return Load()
+	return loadLocked()
 }
 
 func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	return loadLocked()
+}
 
+func loadLocked() error {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {

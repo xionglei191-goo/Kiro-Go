@@ -120,22 +120,32 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string                `json:"model"`
-	Messages    []ClaudeMessage       `json:"messages"`
-	MaxTokens   int                   `json:"max_tokens"`
-	Temperature float64               `json:"temperature,omitempty"`
-	TopP        float64               `json:"top_p,omitempty"`
-	Stream      bool                  `json:"stream,omitempty"`
-	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
-	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	Model        string                `json:"model"`
+	Messages     []ClaudeMessage       `json:"messages"`
+	MaxTokens    int                   `json:"max_tokens"`
+	Temperature  float64               `json:"temperature,omitempty"`
+	TopP         float64               `json:"top_p,omitempty"`
+	Stream       bool                  `json:"stream,omitempty"`
+	System       interface{}           `json:"system,omitempty"` // string or []SystemBlock
+	Thinking     *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	Tools        []ClaudeTool          `json:"tools,omitempty"`
+	ToolChoice   interface{}           `json:"tool_choice,omitempty"`
+	OutputConfig *ClaudeOutputConfig   `json:"output_config,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
 	Type         string `json:"type,omitempty"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 	Display      string `json:"display,omitempty"`
+}
+
+type ClaudeOutputConfig struct {
+	Format *ClaudeOutputFormat `json:"format,omitempty"`
+}
+
+type ClaudeOutputFormat struct {
+	Type   string      `json:"type,omitempty"`
+	Schema interface{} `json:"schema,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -326,13 +336,20 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 转换工具
 	kiroTools, toolNameMap := convertClaudeTools(tools)
+	clientToolCount := len(kiroTools)
+	structuredOutputToolName := ""
+	if schema, ok := claudeStructuredOutputSchema(req); ok {
+		kiroTools, structuredOutputToolName = addClaudeStructuredOutputTool(kiroTools, schema)
+		finalContent = appendSystemInstruction(finalContent, buildClaudeStructuredOutputPrompt(structuredOutputToolName))
+	}
 
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
-	payload.ClaudeCodeAgent = claudeCodeAgent && len(kiroTools) > 0
+	payload.ClaudeCodeAgent = claudeCodeAgent && clientToolCount > 0
 	toolChoiceType, _ := parseClaudeToolChoice(req.ToolChoice)
 	payload.ClaudeToolChoiceRequired = toolChoiceType == "any" || toolChoiceType == "tool"
+	payload.StructuredOutputToolName = structuredOutputToolName
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()

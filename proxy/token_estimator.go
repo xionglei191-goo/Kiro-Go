@@ -62,6 +62,10 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 		total += estimateApproxTokens(tool.Description)
 		total += estimateJSONTokens(tool.InputSchema)
 	}
+	if req.OutputConfig != nil && req.OutputConfig.Format != nil {
+		total += estimateApproxTokens(req.OutputConfig.Format.Type)
+		total += estimateJSONTokens(req.OutputConfig.Format.Schema)
+	}
 
 	return total
 }
