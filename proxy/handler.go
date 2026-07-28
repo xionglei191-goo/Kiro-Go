@@ -1349,7 +1349,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
 		}
-		logger.Debugf("[ClaudeStop] model=%s stream=true stop_reason=%s tool_count=%d auto_continue=%t", model, stopReason, len(toolUses), autoContinuationAttempted)
+		if stopReason == "end_turn" {
+			logger.Infof(
+				"[ClaudeEndTurn] conversation=%s model=%s stream=true output_chars=%d tools_available=%d auto_continue=%t decision=%s",
+				claudeConversationLogID(payload),
+				model,
+				len([]rune(outputContent)),
+				len(currentKiroTools(payload)),
+				autoContinuationAttempted,
+				claudeToolAutoContinueDecision(payload, outputContent, toolUses),
+			)
+		} else {
+			logger.Debugf("[ClaudeStop] model=%s stream=true stop_reason=%s tool_count=%d auto_continue=%t", model, stopReason, len(toolUses), autoContinuationAttempted)
+		}
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -1647,7 +1659,19 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
-		logger.Debugf("[ClaudeStop] model=%s stream=false stop_reason=%s tool_count=%d auto_continue=%t", model, resp.StopReason, len(toolUses), autoContinuationAttempted)
+		if resp.StopReason == "end_turn" {
+			logger.Infof(
+				"[ClaudeEndTurn] conversation=%s model=%s stream=false output_chars=%d tools_available=%d auto_continue=%t decision=%s",
+				claudeConversationLogID(payload),
+				model,
+				len([]rune(finalContent)),
+				len(currentKiroTools(payload)),
+				autoContinuationAttempted,
+				claudeToolAutoContinueDecision(payload, finalContent, toolUses),
+			)
+		} else {
+			logger.Debugf("[ClaudeStop] model=%s stream=false stop_reason=%s tool_count=%d auto_continue=%t", model, resp.StopReason, len(toolUses), autoContinuationAttempted)
+		}
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens

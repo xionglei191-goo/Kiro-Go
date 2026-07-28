@@ -52,21 +52,36 @@ func (m kiroCallMetrics) effectiveInputTokens(fallback int) int {
 }
 
 func shouldAutoContinueClaudeToolCall(payload *KiroPayload, content string, toolUses []KiroToolUse) bool {
-	if payload == nil || len(toolUses) > 0 || len(currentKiroTools(payload)) == 0 {
-		return false
-	}
+	return claudeToolAutoContinueDecision(payload, content, toolUses) == "action_intent"
+}
 
+func claudeToolAutoContinueDecision(payload *KiroPayload, content string, toolUses []KiroToolUse) string {
+	if payload == nil {
+		return "no_payload"
+	}
+	if len(toolUses) > 0 {
+		return "tool_already_used"
+	}
+	if len(currentKiroTools(payload)) == 0 {
+		return "no_tools"
+	}
 	content = strings.TrimSpace(content)
-	if content == "" || len([]rune(content)) > maxClaudeToolIntentRunes {
-		return false
+	if content == "" {
+		return "empty"
+	}
+	if len([]rune(content)) > maxClaudeToolIntentRunes {
+		return "long_response"
 	}
 	if strings.HasSuffix(content, "?") || strings.HasSuffix(content, "？") {
-		return false
+		return "question"
 	}
 
-	return hasTerminalClaudeToolIntent(claudeEnglishToolIntentPattern, content) ||
+	if hasTerminalClaudeToolIntent(claudeEnglishToolIntentPattern, content) ||
 		hasTerminalClaudeToolIntent(claudeEnglishProgressIntentPattern, content) ||
-		hasTerminalClaudeToolIntent(claudeChineseToolIntentPattern, content)
+		hasTerminalClaudeToolIntent(claudeChineseToolIntentPattern, content) {
+		return "action_intent"
+	}
+	return "no_action_intent"
 }
 
 func hasTerminalClaudeToolIntent(pattern *regexp.Regexp, content string) bool {
@@ -144,4 +159,15 @@ func hasKiroSystemPriming(history []KiroHistoryMessage) bool {
 		return false
 	}
 	return history[1].AssistantResponseMessage.Content == "I will follow these instructions."
+}
+
+func claudeConversationLogID(payload *KiroPayload) string {
+	if payload == nil {
+		return ""
+	}
+	id := payload.ConversationState.ConversationID
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
