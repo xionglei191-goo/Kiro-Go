@@ -1765,11 +1765,18 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 // turns were removed so the model is aware context was elided. hasPriming
 // indicates whether history begins with the 2-entry system priming pair.
 func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
+	truncatePayloadToByteLimit(payload, hasPriming, maxPayloadBytes, minRecentHistoryTurns)
+}
+
+func truncatePayloadToByteLimit(payload *KiroPayload, hasPriming bool, byteLimit, minRecentTurns int) {
 	if payload == nil {
 		return
 	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
+	if byteLimit <= 0 || payloadByteSize(payload) <= byteLimit {
 		return
+	}
+	if minRecentTurns < 0 {
+		minRecentTurns = 0
 	}
 
 	history := payload.ConversationState.History
@@ -1810,7 +1817,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	for i := len(conversation) - 1; i >= 0; i-- {
 		running += entrySizes[i]
 		kept := len(conversation) - i
-		if running > maxPayloadBytes && kept > minRecentHistoryTurns {
+		if running > byteLimit && kept > minRecentTurns {
 			break
 		}
 		keepFrom = i
@@ -1829,8 +1836,8 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 
 	// If still too large (current message or retained tail alone exceeds the
 	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
-		truncateCurrentMessage(payload)
+	if payloadByteSize(payload) > byteLimit {
+		truncateCurrentMessageToByteLimit(payload, byteLimit)
 	}
 }
 
@@ -1870,9 +1877,13 @@ func currentMessageModelID(payload *KiroPayload) string {
 // resort when even the minimal retained history plus current message exceeds the
 // limit.
 func truncateCurrentMessage(payload *KiroPayload) {
+	truncateCurrentMessageToByteLimit(payload, maxPayloadBytes)
+}
+
+func truncateCurrentMessageToByteLimit(payload *KiroPayload, byteLimit int) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
 	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
+	budget := byteLimit - overhead
 	if budget < 0 {
 		budget = 0
 	}

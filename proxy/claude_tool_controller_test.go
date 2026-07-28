@@ -210,6 +210,72 @@ func TestClaudeControllerPreservesSmallerMaxTokens(t *testing.T) {
 	}
 }
 
+func TestClaudeControllerCompactsOversizedHistoryToAuxiliaryLimit(t *testing.T) {
+	payload := claudeToolControllerTestPayload()
+	payload.ConversationState.History = []KiroHistoryMessage{
+		{
+			UserInputMessage: &KiroUserInputMessage{
+				Content: "system instructions",
+				ModelID: "claude-opus-5",
+				Origin:  "AI_EDITOR",
+			},
+		},
+		{
+			AssistantResponseMessage: &KiroAssistantResponseMessage{
+				Content: "I will follow these instructions.",
+			},
+		},
+	}
+	largeTurn := strings.Repeat("repository output and implementation detail ", 5000)
+	for i := 0; i < 12; i++ {
+		payload.ConversationState.History = append(
+			payload.ConversationState.History,
+			KiroHistoryMessage{UserInputMessage: &KiroUserInputMessage{
+				Content: largeTurn,
+				ModelID: "claude-opus-5",
+				Origin:  "AI_EDITOR",
+			}},
+			KiroHistoryMessage{AssistantResponseMessage: &KiroAssistantResponseMessage{
+				Content: largeTurn,
+			}},
+		)
+	}
+	primarySize := payloadByteSize(payload)
+
+	controller := buildClaudeToolControllerPayload(payload, "Run the remaining verification.")
+	if controller == nil {
+		t.Fatal("expected controller payload")
+	}
+	if got := payloadByteSize(controller); got > claudeControllerMaxPayloadBytes {
+		t.Fatalf("controller payload size = %d, limit = %d", got, claudeControllerMaxPayloadBytes)
+	}
+	if primarySize <= claudeControllerMaxPayloadBytes {
+		t.Fatalf("test payload must exceed controller limit, got %d", primarySize)
+	}
+	if got := payloadByteSize(payload); got != primarySize {
+		t.Fatalf("building controller mutated primary payload size: got %d, want %d", got, primarySize)
+	}
+
+	foundPlaceholder := false
+	foundPreviousResponse := false
+	for _, item := range controller.ConversationState.History {
+		if user := item.UserInputMessage; user != nil &&
+			strings.Contains(user.Content, "truncated to fit") {
+			foundPlaceholder = true
+		}
+		if assistant := item.AssistantResponseMessage; assistant != nil &&
+			assistant.Content == "Run the remaining verification." {
+			foundPreviousResponse = true
+		}
+	}
+	if !foundPlaceholder {
+		t.Fatal("expected controller history truncation marker")
+	}
+	if !foundPreviousResponse {
+		t.Fatal("controller lost the immediately preceding assistant response")
+	}
+}
+
 func TestClaudeControllerToolNamesAvoidClientCollisions(t *testing.T) {
 	payload := claudeToolControllerTestPayload()
 	context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext

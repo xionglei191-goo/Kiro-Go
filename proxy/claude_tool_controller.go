@@ -11,10 +11,12 @@ import (
 )
 
 const (
-	claudeControllerFinishToolBase = "kiroGoFinishTask"
-	claudeControllerWaitToolBase   = "kiroGoWaitForUser"
-	claudeControllerModelEnv       = "KIRO_CLAUDE_CONTROLLER_MODEL"
-	claudeControllerMaxTokens      = 1024
+	claudeControllerFinishToolBase  = "kiroGoFinishTask"
+	claudeControllerWaitToolBase    = "kiroGoWaitForUser"
+	claudeControllerModelEnv        = "KIRO_CLAUDE_CONTROLLER_MODEL"
+	claudeControllerMaxTokens       = 1024
+	claudeControllerMaxPayloadBytes = 512 * 1024
+	claudeControllerRecentTurns     = 2
 )
 
 type claudeControllerOutcome string
@@ -232,7 +234,12 @@ func buildClaudeToolControllerPayload(payload *KiroPayload, assistantContent str
 		controller.InferenceConfig.MaxTokens = claudeControllerMaxTokens
 	}
 
-	truncatePayloadToLimit(&controller, hasPriming)
+	truncatePayloadToByteLimit(
+		&controller,
+		hasPriming,
+		claudeControllerMaxPayloadBytes,
+		claudeControllerRecentTurns,
+	)
 	return &controller
 }
 

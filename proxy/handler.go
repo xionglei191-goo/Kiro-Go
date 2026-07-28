@@ -1369,9 +1369,17 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
 				controllerModel := currentMessageModelID(controllerPayload)
+				controllerPayloadMetrics := measureKiroPayload(controllerPayload)
 				auxiliaryMetrics.Purpose = "controller"
 				auxiliaryMetrics.Model = controllerModel
-				logger.Infof("[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true action=verify", claudeConversationLogID(payload), model, controllerModel)
+				logger.Infof(
+					"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true action=verify payload_bytes=%d history_bytes=%d",
+					claudeConversationLogID(payload),
+					model,
+					controllerModel,
+					controllerPayloadMetrics.PayloadBytes,
+					controllerPayloadMetrics.HistoryBytes,
+				)
 				var controllerToolUses []KiroToolUse
 				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(controllerModel, nil, func(toolUse KiroToolUse) {
 					controllerToolUses = append(controllerToolUses, toolUse)
@@ -1775,9 +1783,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
 				controllerModel := currentMessageModelID(controllerPayload)
+				controllerPayloadMetrics := measureKiroPayload(controllerPayload)
 				auxiliaryMetrics.Purpose = "controller"
 				auxiliaryMetrics.Model = controllerModel
-				logger.Infof("[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false action=verify", claudeConversationLogID(payload), model, controllerModel)
+				logger.Infof(
+					"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false action=verify payload_bytes=%d history_bytes=%d",
+					claudeConversationLogID(payload),
+					model,
+					controllerModel,
+					controllerPayloadMetrics.PayloadBytes,
+					controllerPayloadMetrics.HistoryBytes,
+				)
 				var controllerToolUses []KiroToolUse
 				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(controllerModel, nil, func(toolUse KiroToolUse) {
 					controllerToolUses = append(controllerToolUses, toolUse)
