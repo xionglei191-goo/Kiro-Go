@@ -170,6 +170,7 @@ type KiroPayload struct {
 	// decision tools are never exposed to the client.
 	ClaudeCodeAgent          bool   `json:"-"`
 	ClaudeToolChoiceRequired bool   `json:"-"`
+	ControllerOriginalTask   string `json:"-"`
 	ControllerFinishToolName string `json:"-"`
 	ControllerWaitToolName   string `json:"-"`
 	StructuredOutputToolName string `json:"-"`
@@ -326,6 +327,20 @@ func upstreamError(statusCode int, endpoint, body string) error {
 	return fmt.Errorf("HTTP %d from %s: %s", statusCode, endpoint, body)
 }
 
+func isContentLengthExceededError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isContentLengthExceededMessage(err.Error())
+}
+
+func isContentLengthExceededMessage(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "content_length_exceeds_threshold") ||
+		strings.Contains(message, "input is too long") ||
+		strings.Contains(message, "input content length exceeds threshold")
+}
+
 // parseAndStream wraps parseEventStream so CallKiroAPI's 200 path can defer the
 // upstream body close (closing even on a callback panic, so the TCP connection
 // is returned to the transport pool instead of leaking). Without the defer, a
@@ -441,6 +456,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 				return lastErr
 			}
 			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
+			if isContentLengthExceededError(lastErr) {
+				return lastErr
+			}
 			continue
 		}
 

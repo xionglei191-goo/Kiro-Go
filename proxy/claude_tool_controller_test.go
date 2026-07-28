@@ -211,7 +211,9 @@ func TestClaudeControllerPreservesSmallerMaxTokens(t *testing.T) {
 }
 
 func TestClaudeControllerCompactsOversizedHistoryToAuxiliaryLimit(t *testing.T) {
+	t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
 	payload := claudeToolControllerTestPayload()
+	payload.ControllerOriginalTask = "ORIGINAL TASK: repair the deployment and verify it."
 	payload.ConversationState.History = []KiroHistoryMessage{
 		{
 			UserInputMessage: &KiroUserInputMessage{
@@ -249,6 +251,10 @@ func TestClaudeControllerCompactsOversizedHistoryToAuxiliaryLimit(t *testing.T) 
 	if got := payloadByteSize(controller); got > claudeControllerMaxPayloadBytes {
 		t.Fatalf("controller payload size = %d, limit = %d", got, claudeControllerMaxPayloadBytes)
 	}
+	tokenBudget := claudeControllerInputTokenBudget(payload, false)
+	if got := estimateKiroPayloadTokens(controller); got > tokenBudget {
+		t.Fatalf("controller token estimate = %d, limit = %d", got, tokenBudget)
+	}
 	if primarySize <= claudeControllerMaxPayloadBytes {
 		t.Fatalf("test payload must exceed controller limit, got %d", primarySize)
 	}
@@ -257,23 +263,218 @@ func TestClaudeControllerCompactsOversizedHistoryToAuxiliaryLimit(t *testing.T) 
 	}
 
 	foundPlaceholder := false
-	foundPreviousResponse := false
 	for _, item := range controller.ConversationState.History {
 		if user := item.UserInputMessage; user != nil &&
-			strings.Contains(user.Content, "truncated to fit") {
+			strings.Contains(user.Content, "controller-only history was omitted") {
 			foundPlaceholder = true
-		}
-		if assistant := item.AssistantResponseMessage; assistant != nil &&
-			assistant.Content == "Run the remaining verification." {
-			foundPreviousResponse = true
 		}
 	}
 	if !foundPlaceholder {
 		t.Fatal("expected controller history truncation marker")
 	}
-	if !foundPreviousResponse {
-		t.Fatal("controller lost the immediately preceding assistant response")
+	for i := 1; i < len(controller.ConversationState.History); i++ {
+		previousUser := controller.ConversationState.History[i-1].UserInputMessage != nil
+		currentUser := controller.ConversationState.History[i].UserInputMessage != nil
+		if previousUser == currentUser {
+			t.Fatalf("controller history roles do not alternate at index %d", i)
+		}
 	}
+	currentPrompt := controller.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(currentPrompt, "ORIGINAL TASK: repair the deployment") ||
+		!strings.Contains(currentPrompt, "Run the remaining verification.") {
+		t.Fatalf("controller lost deterministic context anchors: %q", currentPrompt)
+	}
+}
+
+func TestClaudeControllerCompactsByTokenDensityBeforeByteLimit(t *testing.T) {
+	t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
+	payload := claudeToolControllerTestPayload()
+	payload.ControllerOriginalTask = "Keep running checks until the service is healthy."
+	payload.ConversationState.History = []KiroHistoryMessage{
+		{
+			UserInputMessage: &KiroUserInputMessage{
+				Content: "system instructions",
+				ModelID: "claude-opus-5",
+				Origin:  "AI_EDITOR",
+			},
+		},
+		{
+			AssistantResponseMessage: &KiroAssistantResponseMessage{
+				Content: "I will follow these instructions.",
+			},
+		},
+	}
+	denseTurn := strings.Repeat("{}[],:;!@#$%^&*", 2500)
+	for i := 0; i < 4; i++ {
+		payload.ConversationState.History = append(
+			payload.ConversationState.History,
+			KiroHistoryMessage{UserInputMessage: &KiroUserInputMessage{
+				Content: denseTurn,
+				ModelID: "claude-opus-5",
+				Origin:  "AI_EDITOR",
+			}},
+			KiroHistoryMessage{AssistantResponseMessage: &KiroAssistantResponseMessage{
+				Content: denseTurn,
+			}},
+		)
+	}
+	if got := payloadByteSize(payload); got >= claudeControllerMaxPayloadBytes {
+		t.Fatalf("test payload must be below byte limit, got %d", got)
+	}
+
+	controller := buildClaudeToolControllerPayload(payload, "Continue with the next check.")
+	if controller == nil {
+		t.Fatal("expected controller payload")
+	}
+	tokenBudget := claudeControllerInputTokenBudget(payload, false)
+	if got := estimateKiroPayloadTokens(controller); got > tokenBudget {
+		t.Fatalf("controller token estimate = %d, limit = %d", got, tokenBudget)
+	}
+	if got := payloadByteSize(controller); got > claudeControllerMaxPayloadBytes {
+		t.Fatalf("controller payload size = %d, limit = %d", got, claudeControllerMaxPayloadBytes)
+	}
+	currentPrompt := controller.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(currentPrompt, "Keep running checks") ||
+		!strings.Contains(currentPrompt, "Continue with the next check") {
+		t.Fatalf("controller token compaction lost anchors: %q", currentPrompt)
+	}
+}
+
+func TestClaudeControllerRetriesOnceWithFallbackBudgetOnContentLength(t *testing.T) {
+	t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(true); err != nil {
+		t.Fatalf("enable endpoint fallback: %v", err)
+	}
+
+	var mu sync.Mutex
+	var requests []KiroPayload
+	primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload KiroPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, payload)
+		call := len(requests)
+		mu.Unlock()
+		if call == 1 {
+			http.Error(w, `{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`, http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_retry",
+			"name":      "Bash",
+			"input":     `{"command":"check-health"}`,
+			"stop":      true,
+		}))
+	}))
+	defer primaryServer.Close()
+
+	var unexpectedFallbackCalls int
+	unexpectedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		unexpectedFallbackCalls++
+		mu.Unlock()
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer unexpectedServer.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{
+		{URL: primaryServer.URL, Origin: "AI_EDITOR", Name: "first"},
+		{URL: unexpectedServer.URL, Origin: "AI_EDITOR", Name: "second"},
+		{URL: unexpectedServer.URL, Origin: "AI_EDITOR", Name: "third"},
+	}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	source := claudeToolControllerTestPayload()
+	source.ControllerOriginalTask = "Verify the deployment."
+	source.ConversationState.History = append(source.ConversationState.History,
+		KiroHistoryMessage{UserInputMessage: &KiroUserInputMessage{
+			Content: strings.Repeat("long context ", 50_000),
+			ModelID: "claude-opus-5",
+			Origin:  "AI_EDITOR",
+		}},
+	)
+	initial := buildClaudeToolControllerPayload(source, "More checks remain.")
+	account := &config.Account{
+		ID:          "controller-fallback",
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+	}
+	var attempts []bool
+	usedPayload, toolUses, retried, err := callClaudeToolControllerWithFallback(
+		account,
+		source,
+		"More checks remain.",
+		initial,
+		&kiroCallMetrics{},
+		func(_ *KiroPayload, fallback bool) {
+			attempts = append(attempts, fallback)
+		},
+	)
+	if err != nil {
+		t.Fatalf("controller fallback failed: %v", err)
+	}
+	if !retried || len(attempts) != 2 || attempts[0] || !attempts[1] {
+		t.Fatalf("unexpected fallback attempts: retried=%t attempts=%v", retried, attempts)
+	}
+	mu.Lock()
+	unexpectedCalls := unexpectedFallbackCalls
+	mu.Unlock()
+	if unexpectedCalls != 0 {
+		t.Fatalf("content-length error should not fan out across endpoints, got %d calls", unexpectedCalls)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("expected initial call plus one compact retry, got %d", len(requests))
+	}
+	fallbackTokenBudget := claudeControllerInputTokenBudget(source, true)
+	if got := estimateKiroPayloadTokens(usedPayload); got > fallbackTokenBudget {
+		t.Fatalf("fallback token estimate = %d, limit = %d", got, fallbackTokenBudget)
+	}
+	if got := payloadByteSize(usedPayload); got > claudeControllerFallbackPayloadBytes {
+		t.Fatalf("fallback payload size = %d, limit = %d", got, claudeControllerFallbackPayloadBytes)
+	}
+	if len(toolUses) != 1 || toolUses[0].Name != "Bash" {
+		t.Fatalf("fallback tool result was not returned: %#v", toolUses)
+	}
+}
+
+func TestClaudeControllerTokenBudgetTracksControllerModelWindow(t *testing.T) {
+	payload := claudeToolControllerTestPayload()
+
+	t.Run("haiku 200k window", func(t *testing.T) {
+		t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
+		if got := claudeControllerInputTokenBudget(payload, false); got != 150_000 {
+			t.Fatalf("normal Haiku budget = %d, want 150000", got)
+		}
+		if got := claudeControllerInputTokenBudget(payload, true); got != 90_000 {
+			t.Fatalf("fallback Haiku budget = %d, want 90000", got)
+		}
+	})
+
+	t.Run("opus 1m window is capped", func(t *testing.T) {
+		t.Setenv(claudeControllerModelEnv, "same")
+		payload.ConversationState.CurrentMessage.UserInputMessage.ModelID = "claude-opus-4.8"
+		if got := claudeControllerInputTokenBudget(payload, false); got != 300_000 {
+			t.Fatalf("normal Opus budget = %d, want 300000", got)
+		}
+		if got := claudeControllerInputTokenBudget(payload, true); got != 150_000 {
+			t.Fatalf("fallback Opus budget = %d, want 150000", got)
+		}
+	})
 }
 
 func TestClaudeControllerToolNamesAvoidClientCollisions(t *testing.T) {

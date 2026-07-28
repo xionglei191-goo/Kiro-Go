@@ -357,3 +357,28 @@ func TestCallKiroAPIClassifiesByStatusCode(t *testing.T) {
 		t.Fatal("suspension body should classify as suspension")
 	}
 }
+
+func TestContentLengthExceededClassification(t *testing.T) {
+	for _, message := range []string{
+		`HTTP 400: {"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`,
+		`HTTP 400: {"message":"Input is too long."}`,
+		`HTTP 400: {"message":"Input content length exceeds threshold."}`,
+	} {
+		if !isContentLengthExceededMessage(message) {
+			t.Fatalf("content-length error was not recognized: %q", message)
+		}
+		if got := classifyError(message); got != "content_length" {
+			t.Fatalf("classifyError(%q) = %q, want content_length", message, got)
+		}
+	}
+
+	for _, message := range []string{
+		"quota exhausted",
+		"HTTP 500 internal server error",
+		"context deadline exceeded",
+	} {
+		if isContentLengthExceededMessage(message) {
+			t.Fatalf("unrelated error matched content length: %q", message)
+		}
+	}
+}

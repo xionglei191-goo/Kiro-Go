@@ -1369,31 +1369,45 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
 				controllerModel := currentMessageModelID(controllerPayload)
-				controllerPayloadMetrics := measureKiroPayload(controllerPayload)
 				auxiliaryMetrics.Purpose = "controller"
 				auxiliaryMetrics.Model = controllerModel
-				logger.Infof(
-					"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true action=verify payload_bytes=%d history_bytes=%d",
-					claudeConversationLogID(payload),
-					model,
-					controllerModel,
-					controllerPayloadMetrics.PayloadBytes,
-					controllerPayloadMetrics.HistoryBytes,
-				)
-				var controllerToolUses []KiroToolUse
-				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(controllerModel, nil, func(toolUse KiroToolUse) {
-					controllerToolUses = append(controllerToolUses, toolUse)
-				}))
+				controllerPayload, controllerToolUses, controllerRetried, controllerErr :=
+					callClaudeToolControllerWithFallback(
+						account,
+						payload,
+						firstOutputContent,
+						controllerPayload,
+						&secondMetrics,
+						func(attemptPayload *KiroPayload, fallback bool) {
+							attemptMetrics := measureKiroPayload(attemptPayload)
+							action := "verify"
+							if fallback {
+								action = "retry_compact"
+							}
+							logger.Infof(
+								"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true action=%s payload_bytes=%d history_bytes=%d estimated_input_tokens=%d",
+								claudeConversationLogID(payload),
+								model,
+								currentMessageModelID(attemptPayload),
+								action,
+								attemptMetrics.PayloadBytes,
+								attemptMetrics.HistoryBytes,
+								estimateKiroPayloadTokens(attemptPayload),
+							)
+						},
+					)
+				controllerModel = currentMessageModelID(controllerPayload)
 				if controllerErr != nil {
 					h.handleAccountFailure(account, controllerErr)
 					controllerOutcome = claudeControllerUpstreamError
 					logger.Warnf(
-						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true outcome=%s error_type=%s",
+						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true outcome=%s error_type=%s fallback=%t",
 						claudeConversationLogID(payload),
 						model,
 						controllerModel,
 						controllerOutcome,
 						classifyError(controllerErr.Error()),
+						controllerRetried,
 					)
 				} else {
 					var realToolUses []KiroToolUse
@@ -1402,12 +1416,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 						onToolUse(toolUse)
 					}
 					logger.Infof(
-						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true outcome=%s tool_count=%d",
+						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true outcome=%s tool_count=%d fallback=%t",
 						claudeConversationLogID(payload),
 						model,
 						controllerModel,
 						controllerOutcome,
 						len(realToolUses),
+						controllerRetried,
 					)
 				}
 				auxiliaryMetrics.Outcome = string(controllerOutcome)
@@ -1669,6 +1684,8 @@ func classifyError(msg string) string {
 	switch {
 	case isQuotaErrorMessage(msg):
 		return "quota"
+	case isContentLengthExceededMessage(msg):
+		return "content_length"
 	case isOverageErrorMessage(msg):
 		return "overage"
 	case isSuspensionErrorMessage(msg):
@@ -1783,43 +1800,58 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
 				controllerModel := currentMessageModelID(controllerPayload)
-				controllerPayloadMetrics := measureKiroPayload(controllerPayload)
 				auxiliaryMetrics.Purpose = "controller"
 				auxiliaryMetrics.Model = controllerModel
-				logger.Infof(
-					"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false action=verify payload_bytes=%d history_bytes=%d",
-					claudeConversationLogID(payload),
-					model,
-					controllerModel,
-					controllerPayloadMetrics.PayloadBytes,
-					controllerPayloadMetrics.HistoryBytes,
-				)
-				var controllerToolUses []KiroToolUse
-				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(controllerModel, nil, func(toolUse KiroToolUse) {
-					controllerToolUses = append(controllerToolUses, toolUse)
-				}))
+				controllerPayload, controllerToolUses, controllerRetried, controllerErr :=
+					callClaudeToolControllerWithFallback(
+						account,
+						payload,
+						firstOutputContent,
+						controllerPayload,
+						&secondMetrics,
+						func(attemptPayload *KiroPayload, fallback bool) {
+							attemptMetrics := measureKiroPayload(attemptPayload)
+							action := "verify"
+							if fallback {
+								action = "retry_compact"
+							}
+							logger.Infof(
+								"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false action=%s payload_bytes=%d history_bytes=%d estimated_input_tokens=%d",
+								claudeConversationLogID(payload),
+								model,
+								currentMessageModelID(attemptPayload),
+								action,
+								attemptMetrics.PayloadBytes,
+								attemptMetrics.HistoryBytes,
+								estimateKiroPayloadTokens(attemptPayload),
+							)
+						},
+					)
+				controllerModel = currentMessageModelID(controllerPayload)
 				if controllerErr != nil {
 					h.handleAccountFailure(account, controllerErr)
 					controllerOutcome = claudeControllerUpstreamError
 					logger.Warnf(
-						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false outcome=%s error_type=%s",
+						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false outcome=%s error_type=%s fallback=%t",
 						claudeConversationLogID(payload),
 						model,
 						controllerModel,
 						controllerOutcome,
 						classifyError(controllerErr.Error()),
+						controllerRetried,
 					)
 				} else {
 					var realToolUses []KiroToolUse
 					realToolUses, controllerOutcome = splitClaudeControllerToolUses(controllerPayload, controllerToolUses)
 					toolUses = append(toolUses, realToolUses...)
 					logger.Infof(
-						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false outcome=%s tool_count=%d",
+						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false outcome=%s tool_count=%d fallback=%t",
 						claudeConversationLogID(payload),
 						model,
 						controllerModel,
 						controllerOutcome,
 						len(realToolUses),
+						controllerRetried,
 					)
 				}
 				auxiliaryMetrics.Outcome = string(controllerOutcome)

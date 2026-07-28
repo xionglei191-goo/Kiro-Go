@@ -62,6 +62,40 @@ func TestClaudeToKiroEnablesToolControllerOnlyForClaudeCodeAgentRequests(t *test
 	}
 }
 
+func TestClaudeToKiroPreservesControllerOriginalTaskAcrossPrimaryTruncation(t *testing.T) {
+	originalTask := "ORIGINAL TASK: diagnose the deployment and keep working until verified."
+	req := &ClaudeRequest{
+		Model: "claude-opus-5",
+		System: `You are an interactive agent that helps users with software engineering tasks.
+# Doing tasks
+# Using your tools`,
+		Messages: []ClaudeMessage{{Role: "user", Content: originalTask}},
+		Tools: []ClaudeTool{{
+			Name:        "Bash",
+			Description: "Run a command",
+			InputSchema: map[string]interface{}{"type": "object"},
+		}},
+	}
+	largeTurn := strings.Repeat("implementation output ", 4000)
+	for i := 0; i < 20; i++ {
+		req.Messages = append(req.Messages,
+			ClaudeMessage{Role: "assistant", Content: largeTurn},
+			ClaudeMessage{Role: "user", Content: largeTurn},
+		)
+	}
+
+	payload := ClaudeToKiro(req, false)
+	if !payload.ClaudeCodeAgent {
+		t.Fatal("expected Claude Code controller metadata")
+	}
+	if payload.ControllerOriginalTask != originalTask {
+		t.Fatalf("controller task anchor = %q, want %q", payload.ControllerOriginalTask, originalTask)
+	}
+	if got := payloadByteSize(payload); got > maxPayloadBytes {
+		t.Fatalf("primary payload size = %d, limit = %d", got, maxPayloadBytes)
+	}
+}
+
 func TestClaudeToKiroMapsToolChoice(t *testing.T) {
 	tools := []ClaudeTool{
 		{Name: "read_file", InputSchema: map[string]interface{}{"type": "object"}},

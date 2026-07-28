@@ -352,6 +352,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
 	payload.ClaudeCodeAgent = claudeCodeAgent && clientToolCount > 0
+	if payload.ClaudeCodeAgent {
+		payload.ControllerOriginalTask = firstClaudeConversationAnchor(req.Messages)
+	}
 	toolChoiceType, _ := parseClaudeToolChoice(req.ToolChoice)
 	payload.ClaudeToolChoiceRequired = toolChoiceType == "any" || toolChoiceType == "tool"
 	payload.StructuredOutputToolName = structuredOutputToolName
