@@ -16,14 +16,14 @@ const (
 	claudeControllerWaitToolBase    = "kiroGoWaitForUser"
 	claudeControllerModelEnv        = "KIRO_CLAUDE_CONTROLLER_MODEL"
 	claudeControllerMaxTokens       = 1024
-	claudeControllerMaxPayloadBytes = 512 * 1024
+	claudeControllerMaxPayloadBytes = 320 * 1024
 
-	claudeControllerTokenBudgetPercent         = 75
-	claudeControllerTokenBudgetCap             = 300_000
-	claudeControllerFallbackPayloadBytes       = 320 * 1024
+	claudeControllerTokenBudgetPercent         = 45
+	claudeControllerTokenBudgetCap             = 150_000
+	claudeControllerFallbackPayloadBytes       = 192 * 1024
 	claudeControllerFallbackMaxTokens          = 256
-	claudeControllerFallbackTokenBudgetPercent = 45
-	claudeControllerFallbackTokenBudgetCap     = 150_000
+	claudeControllerFallbackTokenBudgetPercent = 25
+	claudeControllerFallbackTokenBudgetCap     = 75_000
 )
 
 type claudeControllerOutcome string
@@ -617,6 +617,7 @@ func buildClaudeControllerPrompt(finishName, waitName string, toolChoiceRequired
 		return `Act as the execution controller for the current Claude Code task.
 Review the original user task, conversation history, tool results, and the previous assistant response.
 The client requires a real tool call in this turn. Invoke one or more appropriate provided tools now without emitting text.
+Your response is invalid unless it contains at least one provided tool invocation. Do not return prose, analysis, or an empty response.
 Never describe what you intend to do; emit the selected tool call now.`
 	}
 	return fmt.Sprintf(`Act as the execution controller for the current Claude Code task.
@@ -625,6 +626,7 @@ Make exactly one structured decision now, without emitting text:
 - If autonomous work remains, invoke one or more appropriate real tools now.
 - If the task is fully complete and no command, build, deployment, test, monitoring, verification, or cleanup remains, invoke %q.
 - If progress genuinely requires explicit user input, approval, credentials, or a decision that no available tool can obtain, invoke %q.
+Your response is invalid unless it contains at least one provided tool invocation. Do not return prose, analysis, or an empty response.
 Never signal completion merely because a command or background process is still running. Never describe what you intend to do; emit the selected tool call now.`, finishName, waitName)
 }
 
