@@ -131,6 +131,11 @@ type ClaudeRequest struct {
 	Tools        []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice   interface{}           `json:"tool_choice,omitempty"`
 	OutputConfig *ClaudeOutputConfig   `json:"output_config,omitempty"`
+	Metadata     *ClaudeMetadata       `json:"metadata,omitempty"`
+}
+
+type ClaudeMetadata struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
@@ -352,8 +357,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.StructuredOutputToolName = structuredOutputToolName
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
-	payload.ConversationState.AgentContinuationId = uuid.New().String()
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.ConversationID = buildClaudeConversationID(req, modelID, systemPrompt)
+	payload.ConversationState.AgentContinuationId = deriveAgentContinuationID(payload.ConversationState.ConversationID)
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -1960,6 +1965,69 @@ func buildConversationID(modelID, systemPrompt, anchor string) string {
 	}
 	seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
+}
+
+func buildClaudeConversationID(req *ClaudeRequest, modelID, systemPrompt string) string {
+	if req != nil {
+		if sessionID := extractClaudeSessionID(req.Metadata); sessionID != "" {
+			return sessionID
+		}
+		return buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	}
+	return uuid.New().String()
+}
+
+func extractClaudeSessionID(metadata *ClaudeMetadata) string {
+	if metadata == nil {
+		return ""
+	}
+	userID := strings.TrimSpace(metadata.UserID)
+	if userID == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(userID, "{") {
+		var value map[string]interface{}
+		if json.Unmarshal([]byte(userID), &value) == nil {
+			for _, key := range []string{"session_id", "id"} {
+				if candidate, ok := value[key].(string); ok {
+					if normalized := normalizeCanonicalUUID(candidate); normalized != "" {
+						return normalized
+					}
+				}
+			}
+		}
+	}
+
+	if index := strings.Index(userID, "session_"); index >= 0 {
+		candidate := userID[index+len("session_"):]
+		if len(candidate) >= 36 {
+			return normalizeCanonicalUUID(candidate[:36])
+		}
+	}
+	return ""
+}
+
+func normalizeCanonicalUUID(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) != 36 {
+		return ""
+	}
+	parsed, err := uuid.Parse(value)
+	if err != nil || !strings.EqualFold(parsed.String(), value) {
+		return ""
+	}
+	return parsed.String()
+}
+
+func deriveAgentContinuationID(conversationID string) string {
+	if strings.TrimSpace(conversationID) == "" {
+		return uuid.New().String()
+	}
+	return uuid.NewSHA1(
+		uuid.NameSpaceURL,
+		[]byte("agent-continuation:"+conversationID),
+	).String()
 }
 
 func isSyntheticConversationAnchor(anchor string) bool {

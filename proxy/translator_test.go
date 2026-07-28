@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -327,6 +328,107 @@ func TestClaudeConversationIDStableFromAnchor(t *testing.T) {
 	}
 	if payloadA.ConversationState.ConversationID != payloadB.ConversationState.ConversationID {
 		t.Fatalf("expected stable conversation ID across turns, got %q vs %q", payloadA.ConversationState.ConversationID, payloadB.ConversationState.ConversationID)
+	}
+	if payloadA.ConversationState.AgentContinuationId != payloadB.ConversationState.AgentContinuationId {
+		t.Fatalf(
+			"expected stable agent continuation ID across turns, got %q vs %q",
+			payloadA.ConversationState.AgentContinuationId,
+			payloadB.ConversationState.AgentContinuationId,
+		)
+	}
+}
+
+func TestClaudeSessionMetadataStabilizesConversationAcrossPromptChanges(t *testing.T) {
+	sessionID := "0b4445e1-f5be-49e1-87ce-62bbc28ad705"
+	build := func(system, firstMessage string) *KiroPayload {
+		return ClaudeToKiro(&ClaudeRequest{
+			Model:    "claude-opus-5",
+			System:   system,
+			Metadata: &ClaudeMetadata{UserID: "user_account__session_" + sessionID},
+			Messages: []ClaudeMessage{
+				{Role: "user", Content: firstMessage},
+			},
+		}, false)
+	}
+
+	first := build("system prompt before git status changed", "first task")
+	second := build("system prompt after git status changed", "different first task")
+	if first.ConversationState.ConversationID != sessionID ||
+		second.ConversationState.ConversationID != sessionID {
+		t.Fatalf(
+			"expected metadata session ID to win, got %q and %q",
+			first.ConversationState.ConversationID,
+			second.ConversationState.ConversationID,
+		)
+	}
+	if first.ConversationState.AgentContinuationId != second.ConversationState.AgentContinuationId {
+		t.Fatalf(
+			"expected stable continuation ID for one Claude session, got %q and %q",
+			first.ConversationState.AgentContinuationId,
+			second.ConversationState.AgentContinuationId,
+		)
+	}
+}
+
+func TestClaudeSessionMetadataSupportsJSONUserID(t *testing.T) {
+	sessionID := "3d69af26-0a80-483f-baa0-b4ccaaa07e81"
+	req := &ClaudeRequest{
+		Model:    "claude-opus-5",
+		Metadata: &ClaudeMetadata{UserID: `{"session_id":"` + sessionID + `"}`},
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hello"},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	if payload.ConversationState.ConversationID != sessionID {
+		t.Fatalf("expected JSON metadata session ID, got %q", payload.ConversationState.ConversationID)
+	}
+	if payload.ConversationState.AgentContinuationId == "" {
+		t.Fatal("expected derived agent continuation ID")
+	}
+}
+
+func TestClaudeRequestDecodesSessionMetadata(t *testing.T) {
+	const sessionID = "5915a323-62a9-4ced-86f7-3844ff1a733b"
+	raw := `{
+		"model":"claude-opus-5",
+		"max_tokens":64,
+		"metadata":{"user_id":"user_account__session_` + sessionID + `"},
+		"messages":[{"role":"user","content":"hello"}]
+	}`
+
+	var req ClaudeRequest
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("decode Claude request: %v", err)
+	}
+	payload := ClaudeToKiro(&req, false)
+	if payload.ConversationState.ConversationID != sessionID {
+		t.Fatalf("expected decoded session metadata, got %q", payload.ConversationState.ConversationID)
+	}
+}
+
+func TestClaudeSessionMetadataRejectsInvalidUUID(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:    "claude-opus-5",
+		System:   "stable system",
+		Metadata: &ClaudeMetadata{UserID: `{"session_id":"not-a-uuid"}`},
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "stable task"},
+		},
+	}
+
+	first := ClaudeToKiro(req, false)
+	second := ClaudeToKiro(req, false)
+	if first.ConversationState.ConversationID == "not-a-uuid" {
+		t.Fatal("invalid metadata UUID was accepted")
+	}
+	if first.ConversationState.ConversationID != second.ConversationState.ConversationID {
+		t.Fatalf(
+			"expected deterministic fallback for invalid metadata, got %q and %q",
+			first.ConversationState.ConversationID,
+			second.ConversationState.ConversationID,
+		)
 	}
 }
 
