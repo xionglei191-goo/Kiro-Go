@@ -23,17 +23,26 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64   `json:"time"`               // Unix timestamp
-	Endpoint  string  `json:"endpoint"`           // claude/openai/responses
-	Model     string  `json:"model"`              // Requested model
-	AccountID string  `json:"accountId"`          // Account used
-	ApiKeyID  string  `json:"apiKeyId,omitempty"` // API key entry that made the request (empty on legacy/unauthenticated paths)
-	Status    string  `json:"status"`             // "success" or "error"
-	Error     string  `json:"error"`              // Error message (empty on success)
-	ErrorType string  `json:"errorType"`          // Error category (empty on success)
-	Tokens    int     `json:"tokens"`             // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`            // Credits consumed (0 on failure)
-	Duration  int64   `json:"duration"`           // Request duration in ms
+	Time                int64   `json:"time"`                          // Unix timestamp
+	Endpoint            string  `json:"endpoint"`                      // claude/openai/responses
+	Model               string  `json:"model"`                         // Requested model
+	AccountID           string  `json:"accountId"`                     // Account used
+	ApiKeyID            string  `json:"apiKeyId,omitempty"`            // API key entry that made the request (empty on legacy/unauthenticated paths)
+	Status              string  `json:"status"`                        // "success" or "error"
+	Error               string  `json:"error"`                         // Error message (empty on success)
+	ErrorType           string  `json:"errorType"`                     // Error category (empty on success)
+	Tokens              int     `json:"tokens"`                        // Total tokens (input+output, 0 on failure)
+	InputTokens         int     `json:"inputTokens,omitempty"`         // Input tokens used for accounting
+	OutputTokens        int     `json:"outputTokens,omitempty"`        // Output tokens used for accounting
+	Credits             float64 `json:"credits"`                       // Credits consumed (0 on failure)
+	Duration            int64   `json:"duration"`                      // Request duration in ms
+	TTFT                int64   `json:"ttft,omitempty"`                // Time to first upstream content/tool event in ms
+	PayloadBytes        int     `json:"payloadBytes,omitempty"`        // Serialized primary Kiro payload size
+	HistoryBytes        int     `json:"historyBytes,omitempty"`        // Serialized history portion
+	ToolDefinitionBytes int     `json:"toolDefinitionBytes,omitempty"` // Serialized current tool definitions
+	ToolResultBytes     int     `json:"toolResultBytes,omitempty"`     // Serialized current tool results
+	ToolDefinitionCount int     `json:"toolDefinitionCount,omitempty"`
+	ToolResultCount     int     `json:"toolResultCount,omitempty"`
 }
 
 const requestLogsMaxSize = 500
@@ -496,17 +505,18 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":          "ok",
-		"version":         config.Version,
-		"accounts":        h.pool.Count(),
-		"available":       h.pool.AvailableCount(),
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
-		"cache":           h.promptCache.Stats(),
-		"upstreamCache":   h.upstreamUsage.Stats(),
+		"status":             "ok",
+		"version":            config.Version,
+		"accounts":           h.pool.Count(),
+		"available":          h.pool.AvailableCount(),
+		"totalRequests":      atomic.LoadInt64(&h.totalRequests),
+		"successRequests":    atomic.LoadInt64(&h.successRequests),
+		"failedRequests":     atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":        atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":       h.getCredits(),
+		"cache":              h.promptCache.Stats(),
+		"upstreamCache":      h.upstreamUsage.Stats(),
+		"requestPerformance": requestPerformanceFromLogs(h.getRequestLogs()),
 		// Customer-safe latency distribution (no account identities): with session
 		// affinity on, warm accounts pull the mean/min down over time.
 		"dispatchLatency": h.pool.LatencyAggregate(),
@@ -927,6 +937,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	thinkingFormat := thinkingOpts.Format
 
 	reqStart := time.Now()
+	payloadMetrics := measureKiroPayload(payload)
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
@@ -1417,7 +1428,18 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogWithMetrics(
+			"claude",
+			model,
+			account.ID,
+			apiKeyID,
+			inputTokens,
+			outputTokens,
+			credits,
+			time.Since(reqStart).Milliseconds(),
+			firstMetrics.ttftFrom(reqStart),
+			payloadMetrics,
+		)
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1560,16 +1582,35 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, apiKeyID 
 // recordSuccessLog records a successful request in the request logs.
 // apiKeyID attributes the request to the API key entry that issued it (see above).
 func (h *Handler) recordSuccessLog(endpoint, model, accountID, apiKeyID string, tokens int, credits float64, durationMs int64) {
+	h.recordSuccessLogWithMetrics(endpoint, model, accountID, apiKeyID, tokens, 0, credits, durationMs, 0, requestPayloadMetrics{})
+}
+
+func (h *Handler) recordSuccessLogWithMetrics(
+	endpoint, model, accountID, apiKeyID string,
+	inputTokens, outputTokens int,
+	credits float64,
+	durationMs, ttftMs int64,
+	payload requestPayloadMetrics,
+) {
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		ApiKeyID:  apiKeyID,
-		Status:    "success",
-		Tokens:    tokens,
-		Credits:   credits,
-		Duration:  durationMs,
+		Time:                time.Now().Unix(),
+		Endpoint:            endpoint,
+		Model:               model,
+		AccountID:           accountID,
+		ApiKeyID:            apiKeyID,
+		Status:              "success",
+		Tokens:              inputTokens + outputTokens,
+		InputTokens:         inputTokens,
+		OutputTokens:        outputTokens,
+		Credits:             credits,
+		Duration:            durationMs,
+		TTFT:                ttftMs,
+		PayloadBytes:        payload.PayloadBytes,
+		HistoryBytes:        payload.HistoryBytes,
+		ToolDefinitionBytes: payload.ToolDefinitionBytes,
+		ToolResultBytes:     payload.ToolResultBytes,
+		ToolDefinitionCount: payload.ToolDefinitionCount,
+		ToolResultCount:     payload.ToolResultCount,
 	}
 
 	h.appendRequestLog(entry)
@@ -1624,6 +1665,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
+	payloadMetrics := measureKiroPayload(payload)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
@@ -1770,7 +1812,18 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogWithMetrics(
+			"claude",
+			model,
+			account.ID,
+			apiKeyID,
+			inputTokens,
+			outputTokens,
+			credits,
+			time.Since(reqStart).Milliseconds(),
+			firstMetrics.ttftFrom(reqStart),
+			payloadMetrics,
+		)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""

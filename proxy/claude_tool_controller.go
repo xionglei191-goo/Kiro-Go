@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -30,12 +31,23 @@ type kiroCallMetrics struct {
 	credits         float64
 	usage           KiroTokenUsage
 	upstreamUsage   *upstreamUsageTracker
+	firstContentAt  time.Time
 }
 
 func (m *kiroCallMetrics) callback(model string, onText func(string, bool), onToolUse func(KiroToolUse)) *KiroStreamCallback {
 	return &KiroStreamCallback{
-		OnText:    onText,
-		OnToolUse: onToolUse,
+		OnText: func(text string, isThinking bool) {
+			m.markFirstContent()
+			if onText != nil {
+				onText(text, isThinking)
+			}
+		},
+		OnToolUse: func(toolUse KiroToolUse) {
+			m.markFirstContent()
+			if onToolUse != nil {
+				onToolUse(toolUse)
+			}
+		},
 		OnComplete: func(inputTokens, _ int) {
 			m.inputTokens = inputTokens
 		},
@@ -50,6 +62,19 @@ func (m *kiroCallMetrics) callback(model string, onText func(string, bool), onTo
 			m.realInputTokens = int(percentage * float64(getContextWindowSize(model)) / 100.0)
 		},
 	}
+}
+
+func (m *kiroCallMetrics) markFirstContent() {
+	if m.firstContentAt.IsZero() {
+		m.firstContentAt = time.Now()
+	}
+}
+
+func (m kiroCallMetrics) ttftFrom(requestStartedAt time.Time) int64 {
+	if m.firstContentAt.IsZero() || requestStartedAt.IsZero() {
+		return 0
+	}
+	return m.firstContentAt.Sub(requestStartedAt).Milliseconds()
 }
 
 func (m kiroCallMetrics) effectiveInputTokens(fallback int) int {

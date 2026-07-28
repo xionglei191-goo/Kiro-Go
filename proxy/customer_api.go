@@ -140,15 +140,22 @@ func (h *Handler) handleCustomerMe(w http.ResponseWriter, r *http.Request) {
 // operator data and the key ID is redundant (the caller already knows which
 // key it authenticated with).
 type customerLogView struct {
-	Time      int64   `json:"time"`
-	Endpoint  string  `json:"endpoint"`
-	Model     string  `json:"model"`
-	Status    string  `json:"status"`
-	Error     string  `json:"error,omitempty"`
-	ErrorType string  `json:"errorType,omitempty"`
-	Tokens    int     `json:"tokens"`
-	Credits   float64 `json:"credits"`
-	Duration  int64   `json:"duration"`
+	Time                int64   `json:"time"`
+	Endpoint            string  `json:"endpoint"`
+	Model               string  `json:"model"`
+	Status              string  `json:"status"`
+	Error               string  `json:"error,omitempty"`
+	ErrorType           string  `json:"errorType,omitempty"`
+	Tokens              int     `json:"tokens"`
+	InputTokens         int     `json:"inputTokens,omitempty"`
+	OutputTokens        int     `json:"outputTokens,omitempty"`
+	Credits             float64 `json:"credits"`
+	Duration            int64   `json:"duration"`
+	TTFT                int64   `json:"ttft,omitempty"`
+	PayloadBytes        int     `json:"payloadBytes,omitempty"`
+	HistoryBytes        int     `json:"historyBytes,omitempty"`
+	ToolDefinitionBytes int     `json:"toolDefinitionBytes,omitempty"`
+	ToolResultBytes     int     `json:"toolResultBytes,omitempty"`
 }
 
 // handleCustomerLogs GET /api/logs — recent request logs for the caller's key,
@@ -184,15 +191,22 @@ func (h *Handler) handleCustomerLogs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out = append(out, customerLogView{
-			Time:      l.Time,
-			Endpoint:  l.Endpoint,
-			Model:     l.Model,
-			Status:    l.Status,
-			Error:     l.Error,
-			ErrorType: l.ErrorType,
-			Tokens:    l.Tokens,
-			Credits:   l.Credits,
-			Duration:  l.Duration,
+			Time:                l.Time,
+			Endpoint:            l.Endpoint,
+			Model:               l.Model,
+			Status:              l.Status,
+			Error:               l.Error,
+			ErrorType:           l.ErrorType,
+			Tokens:              l.Tokens,
+			InputTokens:         l.InputTokens,
+			OutputTokens:        l.OutputTokens,
+			Credits:             l.Credits,
+			Duration:            l.Duration,
+			TTFT:                l.TTFT,
+			PayloadBytes:        l.PayloadBytes,
+			HistoryBytes:        l.HistoryBytes,
+			ToolDefinitionBytes: l.ToolDefinitionBytes,
+			ToolResultBytes:     l.ToolResultBytes,
 		})
 		if len(out) >= limit {
 			break

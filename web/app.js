@@ -703,6 +703,13 @@
       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }
 
+  function formatLogBytes(bytes) {
+    if (!bytes) return '-';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  }
+
   function accountLabel(id) {
     if (!id) return '-';
     const acc = accountsData.find(a => a.id === id);
@@ -751,6 +758,8 @@
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
       '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.ttft')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.payload')) + '</th>' +
       '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
       '</tr></thead><tbody>';
@@ -764,7 +773,10 @@
           escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
           '<span class="log-msg" title="' + escapeAttr(l.error) + '">' + escapeHtml(l.error) + '</span>';
       } else {
-        detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(3) + ' cr') : '-') + '</span>';
+        const details = [];
+        if (l.credits) details.push(l.credits.toFixed(3) + ' cr');
+        if (l.toolResultBytes) details.push(escapeHtml(t('logs.toolResult')) + ' ' + formatLogBytes(l.toolResultBytes));
+        detailCell = '<span class="text-muted">' + (details.length ? details.join(' · ') : '-') + '</span>';
       }
       html += '<tr>' +
         '<td>' + escapeHtml(formatLogTime(l.time)) + '</td>' +
@@ -773,6 +785,8 @@
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
         '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
         '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
+        '<td>' + (l.ttft ? (l.ttft + 'ms') : '-') + '</td>' +
+        '<td>' + formatLogBytes(l.payloadBytes) + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';

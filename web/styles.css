@@ -1299,11 +1299,12 @@ img.brand-icon {
 }
 .logs-list {
   max-height: 60vh;
-  overflow-y: auto;
+  overflow: auto;
   border-top: 1px solid var(--border);
 }
 .logs-table {
   width: 100%;
+  min-width: 980px;
   font-size: 0.75rem;
   border-collapse: collapse;
 }
