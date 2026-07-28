@@ -161,6 +161,91 @@ func shouldRunClaudeToolController(payload *KiroPayload, toolUses []KiroToolUse)
 		len(currentKiroRealTools(payload)) > 0
 }
 
+func claudeAssistantRequestsUserInput(content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	visibleLines := make([]string, 0, len(lines))
+	inCodeFence := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inCodeFence = !inCodeFence
+			continue
+		}
+		if inCodeFence || trimmed == "" {
+			continue
+		}
+		visibleLines = append(visibleLines, trimmed)
+		question := strings.TrimRight(trimmed, " \t*_`")
+		if strings.HasSuffix(question, "?") || strings.HasSuffix(question, "？") {
+			return true
+		}
+	}
+
+	visible := strings.ToLower(strings.Join(visibleLines, "\n"))
+	for _, phrase := range []string{
+		"等你确认",
+		"等待你确认",
+		"等你回复",
+		"等待你回复",
+		"等你回答",
+		"等待你回答",
+		"等你决定",
+		"等待你决定",
+		"等你选择",
+		"等待你选择",
+		"需要你确认",
+		"需要用户确认",
+		"请你确认",
+		"请确认",
+		"需要你选择",
+		"请你选择",
+		"请选择",
+		"需要你提供",
+		"请你提供",
+		"请提供",
+		"需要你输入",
+		"请你输入",
+		"需要你的批准",
+		"未经你的批准",
+		"没有你的批准",
+		"waiting for your confirmation",
+		"wait for your confirmation",
+		"waiting for your approval",
+		"wait for your approval",
+		"waiting for your response",
+		"wait for your response",
+		"waiting for your answer",
+		"wait for your answer",
+		"waiting for your decision",
+		"wait for your decision",
+		"waiting for your choice",
+		"wait for your choice",
+		"need your confirmation",
+		"need your approval",
+		"need you to confirm",
+		"please confirm",
+		"please provide",
+		"please choose",
+		"please select",
+		"would you like me to",
+		"do you want me to",
+		"should i ",
+		"shall i ",
+		"without your approval",
+		"without your confirmation",
+	} {
+		if strings.Contains(visible, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 func currentKiroTools(payload *KiroPayload) []KiroToolWrapper {
 	if payload == nil {
 		return nil
@@ -325,6 +410,8 @@ func buildClaudeToolControllerPayloadWithBudget(
 		basePrompt += `
 
 This is the final controller decision attempt. A text-only response is invalid.
+Safety remains higher priority than autonomous continuation. If the previous assistant response asks for user confirmation, approval, a choice, credentials, or any other input, invoke the wait-for-user tool.
+Never infer user consent from silence, punctuation-only input, a short acknowledgement, or an unrelated follow-up. When uncertain between continuing and waiting, wait.
 Invoke one or more provided tools now. Do not emit analysis, explanation, or any other text.`
 	}
 	controller.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
@@ -616,16 +703,19 @@ func buildClaudeControllerPrompt(finishName, waitName string, toolChoiceRequired
 	if toolChoiceRequired {
 		return `Act as the execution controller for the current Claude Code task.
 Review the original user task, conversation history, tool results, and the previous assistant response.
+Safety takes priority over autonomous continuation. Never infer user consent or bypass a pending request for confirmation, approval, a choice, credentials, or other input.
 The client requires a real tool call in this turn. Invoke one or more appropriate provided tools now without emitting text.
 Your response is invalid unless it contains at least one provided tool invocation. Do not return prose, analysis, or an empty response.
 Never describe what you intend to do; emit the selected tool call now.`
 	}
 	return fmt.Sprintf(`Act as the execution controller for the current Claude Code task.
 Review the original user task, conversation history, tool results, and the previous assistant response.
+Safety takes priority over autonomous continuation. Never infer user consent from silence, punctuation-only input, a short acknowledgement, or an unrelated follow-up.
 Make exactly one structured decision now, without emitting text:
 - If autonomous work remains, invoke one or more appropriate real tools now.
 - If the task is fully complete and no command, build, deployment, test, monitoring, verification, or cleanup remains, invoke %q.
-- If progress genuinely requires explicit user input, approval, credentials, or a decision that no available tool can obtain, invoke %q.
+- If the previous assistant response asks for confirmation, approval, a choice, credentials, or any other user input, or progress otherwise requires a decision that no available tool can obtain, invoke %q.
+When uncertain between continuing and waiting for the user, wait.
 Your response is invalid unless it contains at least one provided tool invocation. Do not return prose, analysis, or an empty response.
 Never signal completion merely because a command or background process is still running. Never describe what you intend to do; emit the selected tool call now.`, finishName, waitName)
 }

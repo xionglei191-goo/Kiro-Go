@@ -44,6 +44,59 @@ func TestShouldRunClaudeToolControllerUsesProtocolStateNotResponseText(t *testin
 	}
 }
 
+func TestClaudeAssistantRequestsUserInput(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "production confirmation regression",
+			content: "改动还未提交。我在等你确认是否提交并部署。",
+			want:    true,
+		},
+		{
+			name:    "chinese direct question",
+			content: "当前提交仍在本地。要我撤销还是保留？",
+			want:    true,
+		},
+		{
+			name:    "english approval",
+			content: "The migration is ready. I am waiting for your approval before applying it.",
+			want:    true,
+		},
+		{
+			name:    "english direct question",
+			content: "Would you like me to deploy this build now?",
+			want:    true,
+		},
+		{
+			name: "question inside code fence",
+			content: "The command printed:\n```\nProceed? [y/N]\n```\n" +
+				"I will inspect the non-interactive flags next.",
+			want: false,
+		},
+		{
+			name:    "autonomous whether statement",
+			content: "I need to know whether the service is healthy, so I will run the health check.",
+			want:    false,
+		},
+		{
+			name:    "normal continuation",
+			content: "The build passed. I will run the remaining integration tests.",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := claudeAssistantRequestsUserInput(tt.content); got != tt.want {
+				t.Fatalf("claudeAssistantRequestsUserInput() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildClaudeToolControllerPayload(t *testing.T) {
 	payload := claudeToolControllerTestPayload()
 	payload.ToolNameMap = map[string]string{"Bash": "mcp__shell__Bash"}
@@ -111,7 +164,8 @@ func TestBuildClaudeToolControllerPayload(t *testing.T) {
 	if !strings.Contains(current.Content, controller.ControllerFinishToolName) ||
 		!strings.Contains(current.Content, controller.ControllerWaitToolName) ||
 		!strings.Contains(current.Content, "without emitting text") ||
-		!strings.Contains(current.Content, "response is invalid unless") {
+		!strings.Contains(current.Content, "response is invalid unless") ||
+		!strings.Contains(current.Content, "Safety takes priority") {
 		t.Fatalf("unexpected controller instruction: %q", current.Content)
 	}
 	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.Tools) != 3 {
@@ -464,6 +518,12 @@ func TestClaudeControllerRetriesOnceWithFallbackBudgetOnContentLength(t *testing
 	) {
 		t.Fatal("fallback controller prompt was not tightened")
 	}
+	if !strings.Contains(
+		usedPayload.ConversationState.CurrentMessage.UserInputMessage.Content,
+		"Safety remains higher priority",
+	) {
+		t.Fatal("fallback controller prompt lost its safety priority")
+	}
 }
 
 func TestClaudeControllerTokenBudgetTracksControllerModelWindow(t *testing.T) {
@@ -636,6 +696,45 @@ func TestClaudeHandlersControllerContinuesWithRealTool(t *testing.T) {
 					block.Name == claudeControllerWaitToolBase {
 					t.Fatalf("response leaked internal controller output: %#v", response.Content)
 				}
+			}
+		})
+	}
+}
+
+func TestClaudeHandlersPreserveExplicitUserConfirmation(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			const confirmation = "改动还未提交。我在等你确认是否提交并部署。"
+			recorder, requests := runClaudeControllerHandlerTest(t, stream, func(call int, _ KiroPayload) []byte {
+				if call == 1 {
+					return awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+						"content":     confirmation,
+						"inputTokens": 100,
+					})
+				}
+				return awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+					"toolUseId": "toolu_unauthorized",
+					"name":      "Bash",
+					"input":     `{"command":"git push origin main"}`,
+					"stop":      true,
+				})
+			})
+
+			if len(requests) != 1 {
+				t.Fatalf("explicit confirmation request triggered %d upstream calls, want 1", len(requests))
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, confirmation) ||
+				!strings.Contains(body, `"stop_reason":"end_turn"`) {
+				t.Fatalf("confirmation request was not preserved as end_turn: %s", body)
+			}
+			if strings.Contains(body, "toolu_unauthorized") ||
+				strings.Contains(body, "git push origin main") {
+				t.Fatalf("confirmation request leaked an unauthorized tool call: %s", body)
 			}
 		})
 	}

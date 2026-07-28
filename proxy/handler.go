@@ -1366,7 +1366,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			closeActiveBlock()
 		}
 		if shouldRunClaudeToolController(payload, toolUses) {
-			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
+			if claudeAssistantRequestsUserInput(firstOutputContent) {
+				controllerOutcome = claudeControllerWaitForUser
+				logger.Infof(
+					"[ClaudeToolController] conversation=%s model=%s stream=true action=preserve_user_wait outcome=%s reason=assistant_request",
+					claudeConversationLogID(payload),
+					model,
+					controllerOutcome,
+				)
+			} else if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
 				controllerModel := currentMessageModelID(controllerPayload)
 				auxiliaryMetrics.Purpose = "controller"
@@ -1805,7 +1813,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 		if shouldRunClaudeToolController(payload, toolUses) {
-			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
+			if claudeAssistantRequestsUserInput(firstOutputContent) {
+				controllerOutcome = claudeControllerWaitForUser
+				logger.Infof(
+					"[ClaudeToolController] conversation=%s model=%s stream=false action=preserve_user_wait outcome=%s reason=assistant_request",
+					claudeConversationLogID(payload),
+					model,
+					controllerOutcome,
+				)
+			} else if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
 				controllerModel := currentMessageModelID(controllerPayload)
 				auxiliaryMetrics.Purpose = "controller"
