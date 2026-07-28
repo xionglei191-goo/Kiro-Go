@@ -493,6 +493,7 @@
   "logs.ttft": "TTFT",
   "logs.payload": "Payload",
   "logs.toolResult": "Tool result",
+  "logs.controller": "Controller",
   "logs.duration": "Duration",
   "logs.detail": "Detail",
   "errors.typeQuota": "Quota",

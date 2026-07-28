@@ -493,6 +493,7 @@
   "logs.ttft": "首响应",
   "logs.payload": "请求体",
   "logs.toolResult": "工具结果",
+  "logs.controller": "控制器",
   "logs.duration": "耗时",
   "logs.detail": "详情",
   "errors.typeQuota": "配额",

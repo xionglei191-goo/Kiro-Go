@@ -16,6 +16,15 @@ type requestPayloadMetrics struct {
 	ToolResultCount     int
 }
 
+type requestAuxiliaryMetrics struct {
+	Purpose     string
+	Model       string
+	Outcome     string
+	InputTokens int
+	Credits     float64
+	TTFT        int64
+}
+
 func measureKiroPayload(payload *KiroPayload) requestPayloadMetrics {
 	if payload == nil {
 		return requestPayloadMetrics{}
@@ -55,20 +64,28 @@ func jsonByteLen(value interface{}) int {
 // values describe proxy behavior only; they do not claim an upstream cache hit
 // unless Kiro reports one through the separate upstreamCache statistics.
 type RequestPerformanceStats struct {
-	Samples                       int     `json:"samples"`
-	SamplesWithTTFT               int     `json:"samplesWithTtft"`
-	TTFTP50Ms                     int64   `json:"ttftP50Ms"`
-	TTFTP95Ms                     int64   `json:"ttftP95Ms"`
-	DurationP50Ms                 int64   `json:"durationP50Ms"`
-	DurationP95Ms                 int64   `json:"durationP95Ms"`
-	PayloadP50Bytes               int64   `json:"payloadP50Bytes"`
-	PayloadP95Bytes               int64   `json:"payloadP95Bytes"`
-	MaxPayloadBytes               int64   `json:"maxPayloadBytes"`
-	ToolResultCalls               int     `json:"toolResultCalls"`
-	LargeToolResultCalls          int     `json:"largeToolResultCalls"`
-	LargeToolResultThresholdBytes int     `json:"largeToolResultThresholdBytes"`
-	TotalToolResultBytes          int64   `json:"totalToolResultBytes"`
-	TotalCredits                  float64 `json:"totalCredits"`
+	Samples                       int            `json:"samples"`
+	SamplesWithTTFT               int            `json:"samplesWithTtft"`
+	TTFTP50Ms                     int64          `json:"ttftP50Ms"`
+	TTFTP95Ms                     int64          `json:"ttftP95Ms"`
+	DurationP50Ms                 int64          `json:"durationP50Ms"`
+	DurationP95Ms                 int64          `json:"durationP95Ms"`
+	PayloadP50Bytes               int64          `json:"payloadP50Bytes"`
+	PayloadP95Bytes               int64          `json:"payloadP95Bytes"`
+	MaxPayloadBytes               int64          `json:"maxPayloadBytes"`
+	ToolResultCalls               int            `json:"toolResultCalls"`
+	LargeToolResultCalls          int            `json:"largeToolResultCalls"`
+	LargeToolResultThresholdBytes int            `json:"largeToolResultThresholdBytes"`
+	TotalToolResultBytes          int64          `json:"totalToolResultBytes"`
+	TotalCredits                  float64        `json:"totalCredits"`
+	AuxiliaryCalls                int            `json:"auxiliaryCalls"`
+	AuxiliaryInputTokens          int64          `json:"auxiliaryInputTokens"`
+	AuxiliaryCredits              float64        `json:"auxiliaryCredits"`
+	AuxiliaryTTFTP50Ms            int64          `json:"auxiliaryTtftP50Ms"`
+	AuxiliaryTTFTP95Ms            int64          `json:"auxiliaryTtftP95Ms"`
+	ControllerCalls               int            `json:"controllerCalls"`
+	ControllerModelCounts         map[string]int `json:"controllerModelCounts"`
+	ControllerOutcomeCounts       map[string]int `json:"controllerOutcomeCounts"`
 }
 
 func requestPerformanceFromLogs(logs []RequestLog) RequestPerformanceStats {
@@ -78,6 +95,9 @@ func requestPerformanceFromLogs(logs []RequestLog) RequestPerformanceStats {
 	durations := make([]int64, 0, len(logs))
 	ttfts := make([]int64, 0, len(logs))
 	payloads := make([]int64, 0, len(logs))
+	auxiliaryTTFTs := make([]int64, 0, len(logs))
+	stats.ControllerModelCounts = make(map[string]int)
+	stats.ControllerOutcomeCounts = make(map[string]int)
 
 	for _, entry := range logs {
 		if entry.Status != "success" || entry.PayloadBytes <= 0 {
@@ -101,6 +121,19 @@ func requestPerformanceFromLogs(logs []RequestLog) RequestPerformanceStats {
 		if int64(entry.PayloadBytes) > stats.MaxPayloadBytes {
 			stats.MaxPayloadBytes = int64(entry.PayloadBytes)
 		}
+		if entry.AuxiliaryPurpose != "" {
+			stats.AuxiliaryCalls++
+			stats.AuxiliaryInputTokens += int64(entry.AuxiliaryInputTokens)
+			stats.AuxiliaryCredits += entry.AuxiliaryCredits
+			if entry.AuxiliaryTTFT > 0 {
+				auxiliaryTTFTs = append(auxiliaryTTFTs, entry.AuxiliaryTTFT)
+			}
+		}
+		if entry.AuxiliaryPurpose == "controller" {
+			stats.ControllerCalls++
+			stats.ControllerModelCounts[entry.AuxiliaryModel]++
+			stats.ControllerOutcomeCounts[entry.AuxiliaryOutcome]++
+		}
 	}
 
 	stats.SamplesWithTTFT = len(ttfts)
@@ -110,6 +143,8 @@ func requestPerformanceFromLogs(logs []RequestLog) RequestPerformanceStats {
 	stats.DurationP95Ms = nearestRankPercentile(durations, 95)
 	stats.PayloadP50Bytes = nearestRankPercentile(payloads, 50)
 	stats.PayloadP95Bytes = nearestRankPercentile(payloads, 95)
+	stats.AuxiliaryTTFTP50Ms = nearestRankPercentile(auxiliaryTTFTs, 50)
+	stats.AuxiliaryTTFTP95Ms = nearestRankPercentile(auxiliaryTTFTs, 95)
 	return stats
 }
 

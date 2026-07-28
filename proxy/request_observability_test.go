@@ -41,8 +41,16 @@ func TestMeasureKiroPayloadBreaksOutCurrentContext(t *testing.T) {
 func TestRequestPerformanceFromLogsUsesRecentObservedSuccesses(t *testing.T) {
 	logs := []RequestLog{
 		{Status: "success", PayloadBytes: 100, Duration: 1000, TTFT: 100, Credits: 0.1},
-		{Status: "success", PayloadBytes: 200, Duration: 2000, TTFT: 200, Credits: 0.2, ToolResultBytes: 1024},
-		{Status: "success", PayloadBytes: 300, Duration: 3000, TTFT: 300, Credits: 0.3, ToolResultBytes: largeToolResultThresholdBytes},
+		{
+			Status: "success", PayloadBytes: 200, Duration: 2000, TTFT: 200, Credits: 0.2, ToolResultBytes: 1024,
+			AuxiliaryPurpose: "controller", AuxiliaryModel: "claude-haiku-4.5", AuxiliaryOutcome: "continue",
+			AuxiliaryInputTokens: 1200, AuxiliaryCredits: 0.05, AuxiliaryTTFT: 80,
+		},
+		{
+			Status: "success", PayloadBytes: 300, Duration: 3000, TTFT: 300, Credits: 0.3, ToolResultBytes: largeToolResultThresholdBytes,
+			AuxiliaryPurpose: "controller", AuxiliaryModel: "claude-haiku-4.5", AuxiliaryOutcome: "finish",
+			AuxiliaryInputTokens: 1300, AuxiliaryCredits: 0.06, AuxiliaryTTFT: 100,
+		},
 		{Status: "success", PayloadBytes: 400, Duration: 4000, TTFT: 400, Credits: 0.4},
 		{Status: "error", PayloadBytes: 9999, Duration: 9999, TTFT: 9999},
 		{Status: "success", Duration: 5000, TTFT: 500},
@@ -69,6 +77,19 @@ func TestRequestPerformanceFromLogsUsesRecentObservedSuccesses(t *testing.T) {
 	}
 	if got.TotalCredits < 0.999 || got.TotalCredits > 1.001 {
 		t.Fatalf("unexpected credits total: %+v", got)
+	}
+	if got.AuxiliaryCalls != 2 || got.ControllerCalls != 2 ||
+		got.AuxiliaryInputTokens != 2500 ||
+		got.AuxiliaryCredits < 0.109 || got.AuxiliaryCredits > 0.111 {
+		t.Fatalf("unexpected auxiliary totals: %+v", got)
+	}
+	if got.AuxiliaryTTFTP50Ms != 80 || got.AuxiliaryTTFTP95Ms != 100 {
+		t.Fatalf("unexpected auxiliary TTFT percentiles: %+v", got)
+	}
+	if got.ControllerModelCounts["claude-haiku-4.5"] != 2 ||
+		got.ControllerOutcomeCounts["continue"] != 1 ||
+		got.ControllerOutcomeCounts["finish"] != 1 {
+		t.Fatalf("unexpected controller breakdown: %+v", got)
 	}
 }
 

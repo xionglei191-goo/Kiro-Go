@@ -776,6 +776,16 @@
         const details = [];
         if (l.credits) details.push(l.credits.toFixed(3) + ' cr');
         if (l.toolResultBytes) details.push(escapeHtml(t('logs.toolResult')) + ' ' + formatLogBytes(l.toolResultBytes));
+        if (l.auxiliaryPurpose === 'controller') {
+          const controller = [
+            escapeHtml(t('logs.controller')),
+            escapeHtml(l.auxiliaryModel || '-'),
+            escapeHtml(l.auxiliaryOutcome || '-')
+          ];
+          if (l.auxiliaryCredits) controller.push(l.auxiliaryCredits.toFixed(3) + ' cr');
+          if (l.auxiliaryTtft) controller.push(l.auxiliaryTtft + 'ms');
+          details.push(controller.join(' '));
+        }
         detailCell = '<span class="text-muted">' + (details.length ? details.join(' · ') : '-') + '</span>';
       }
       html += '<tr>' +

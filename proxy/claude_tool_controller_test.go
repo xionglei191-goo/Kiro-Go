@@ -116,6 +116,9 @@ func TestBuildClaudeToolControllerPayload(t *testing.T) {
 	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.Tools) != 3 {
 		t.Fatalf("expected one real and two internal tools, got %#v", current.UserInputMessageContext)
 	}
+	if controller.InferenceConfig == nil || controller.InferenceConfig.MaxTokens != claudeControllerMaxTokens {
+		t.Fatalf("controller max tokens were not capped: %#v", controller.InferenceConfig)
+	}
 	if len(current.UserInputMessageContext.ToolResults) != 0 {
 		t.Fatal("controller turn must not repeat structured tool results")
 	}
@@ -163,6 +166,47 @@ func TestBuildClaudeToolControllerPayload(t *testing.T) {
 	}
 	if payload.ControllerFinishToolName != "" || payload.ControllerWaitToolName != "" {
 		t.Fatal("building a controller request mutated original controller metadata")
+	}
+}
+
+func TestClaudeControllerModelOverride(t *testing.T) {
+	payload := claudeToolControllerTestPayload()
+
+	t.Run("defaults to primary", func(t *testing.T) {
+		t.Setenv(claudeControllerModelEnv, "")
+		controller := buildClaudeToolControllerPayload(payload, "Finished.")
+		if got := currentMessageModelID(controller); got != "claude-opus-5" {
+			t.Fatalf("controller model = %q, want primary model", got)
+		}
+	})
+
+	t.Run("supports normalized Claude model", func(t *testing.T) {
+		t.Setenv(claudeControllerModelEnv, "claude-haiku-4-5")
+		controller := buildClaudeToolControllerPayload(payload, "Finished.")
+		if got := currentMessageModelID(controller); got != "claude-haiku-4.5" {
+			t.Fatalf("controller model = %q, want claude-haiku-4.5", got)
+		}
+	})
+
+	t.Run("invalid model falls back to primary", func(t *testing.T) {
+		t.Setenv(claudeControllerModelEnv, "not-a-claude-model")
+		controller := buildClaudeToolControllerPayload(payload, "Finished.")
+		if got := currentMessageModelID(controller); got != "claude-opus-5" {
+			t.Fatalf("controller model = %q, want primary fallback", got)
+		}
+	})
+}
+
+func TestClaudeControllerPreservesSmallerMaxTokens(t *testing.T) {
+	payload := claudeToolControllerTestPayload()
+	payload.InferenceConfig = &InferenceConfig{MaxTokens: 256}
+
+	controller := buildClaudeToolControllerPayload(payload, "Finished.")
+	if controller.InferenceConfig == nil || controller.InferenceConfig.MaxTokens != 256 {
+		t.Fatalf("controller max tokens = %#v, want 256", controller.InferenceConfig)
+	}
+	if payload.InferenceConfig.MaxTokens != 256 {
+		t.Fatalf("building controller mutated primary inference config: %#v", payload.InferenceConfig)
 	}
 }
 

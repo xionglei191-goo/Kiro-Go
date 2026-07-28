@@ -134,6 +134,7 @@ export KIRO_GO_API_KEY=any
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| `KIRO_CLAUDE_CONTROLLER_MODEL` | 仅用于 Claude Code 继续执行判定的模型；设为 `same` 时沿用主模型 | `same` |
 
 ## 参与贡献
 

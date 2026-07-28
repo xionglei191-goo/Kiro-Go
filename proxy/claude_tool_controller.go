@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 const (
 	claudeControllerFinishToolBase = "kiroGoFinishTask"
 	claudeControllerWaitToolBase   = "kiroGoWaitForUser"
+	claudeControllerModelEnv       = "KIRO_CLAUDE_CONTROLLER_MODEL"
+	claudeControllerMaxTokens      = 1024
 )
 
 type claudeControllerOutcome string
@@ -31,10 +34,14 @@ type kiroCallMetrics struct {
 	credits         float64
 	usage           KiroTokenUsage
 	upstreamUsage   *upstreamUsageTracker
+	startedAt       time.Time
 	firstContentAt  time.Time
 }
 
 func (m *kiroCallMetrics) callback(model string, onText func(string, bool), onToolUse func(KiroToolUse)) *KiroStreamCallback {
+	if m.startedAt.IsZero() {
+		m.startedAt = time.Now()
+	}
 	return &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
 			m.markFirstContent()
@@ -75,6 +82,13 @@ func (m kiroCallMetrics) ttftFrom(requestStartedAt time.Time) int64 {
 		return 0
 	}
 	return m.firstContentAt.Sub(requestStartedAt).Milliseconds()
+}
+
+func (m kiroCallMetrics) ttft() int64 {
+	if m.firstContentAt.IsZero() || m.startedAt.IsZero() {
+		return 0
+	}
+	return m.firstContentAt.Sub(m.startedAt).Milliseconds()
 }
 
 func (m kiroCallMetrics) effectiveInputTokens(fallback int) int {
@@ -125,6 +139,20 @@ func currentKiroRealTools(payload *KiroPayload) []KiroToolWrapper {
 		realTools = append(realTools, tool)
 	}
 	return realTools
+}
+
+func resolveClaudeControllerModel(primaryModel string) string {
+	configured := strings.TrimSpace(os.Getenv(claudeControllerModelEnv))
+	switch strings.ToLower(configured) {
+	case "", "same", "primary":
+		return primaryModel
+	}
+
+	model := MapModel(configured)
+	if !strings.HasPrefix(strings.ToLower(model), "claude-") {
+		return primaryModel
+	}
+	return model
 }
 
 func buildClaudeToolControllerPayload(payload *KiroPayload, assistantContent string) *KiroPayload {
@@ -190,11 +218,18 @@ func buildClaudeToolControllerPayload(payload *KiroPayload, assistantContent str
 			controller.ControllerWaitToolName,
 			payload.ClaudeToolChoiceRequired,
 		),
-		ModelID: originalCurrent.ModelID,
+		ModelID: resolveClaudeControllerModel(originalCurrent.ModelID),
 		Origin:  originalCurrent.Origin,
 		UserInputMessageContext: &UserInputMessageContext{
 			Tools: controllerTools,
 		},
+	}
+	if controller.InferenceConfig == nil {
+		controller.InferenceConfig = &InferenceConfig{}
+	}
+	if controller.InferenceConfig.MaxTokens <= 0 ||
+		controller.InferenceConfig.MaxTokens > claudeControllerMaxTokens {
+		controller.InferenceConfig.MaxTokens = claudeControllerMaxTokens
 	}
 
 	truncatePayloadToLimit(&controller, hasPriming)

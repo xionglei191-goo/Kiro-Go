@@ -23,26 +23,32 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time                int64   `json:"time"`                          // Unix timestamp
-	Endpoint            string  `json:"endpoint"`                      // claude/openai/responses
-	Model               string  `json:"model"`                         // Requested model
-	AccountID           string  `json:"accountId"`                     // Account used
-	ApiKeyID            string  `json:"apiKeyId,omitempty"`            // API key entry that made the request (empty on legacy/unauthenticated paths)
-	Status              string  `json:"status"`                        // "success" or "error"
-	Error               string  `json:"error"`                         // Error message (empty on success)
-	ErrorType           string  `json:"errorType"`                     // Error category (empty on success)
-	Tokens              int     `json:"tokens"`                        // Total tokens (input+output, 0 on failure)
-	InputTokens         int     `json:"inputTokens,omitempty"`         // Input tokens used for accounting
-	OutputTokens        int     `json:"outputTokens,omitempty"`        // Output tokens used for accounting
-	Credits             float64 `json:"credits"`                       // Credits consumed (0 on failure)
-	Duration            int64   `json:"duration"`                      // Request duration in ms
-	TTFT                int64   `json:"ttft,omitempty"`                // Time to first upstream content/tool event in ms
-	PayloadBytes        int     `json:"payloadBytes,omitempty"`        // Serialized primary Kiro payload size
-	HistoryBytes        int     `json:"historyBytes,omitempty"`        // Serialized history portion
-	ToolDefinitionBytes int     `json:"toolDefinitionBytes,omitempty"` // Serialized current tool definitions
-	ToolResultBytes     int     `json:"toolResultBytes,omitempty"`     // Serialized current tool results
-	ToolDefinitionCount int     `json:"toolDefinitionCount,omitempty"`
-	ToolResultCount     int     `json:"toolResultCount,omitempty"`
+	Time                 int64   `json:"time"`                          // Unix timestamp
+	Endpoint             string  `json:"endpoint"`                      // claude/openai/responses
+	Model                string  `json:"model"`                         // Requested model
+	AccountID            string  `json:"accountId"`                     // Account used
+	ApiKeyID             string  `json:"apiKeyId,omitempty"`            // API key entry that made the request (empty on legacy/unauthenticated paths)
+	Status               string  `json:"status"`                        // "success" or "error"
+	Error                string  `json:"error"`                         // Error message (empty on success)
+	ErrorType            string  `json:"errorType"`                     // Error category (empty on success)
+	Tokens               int     `json:"tokens"`                        // Total tokens (input+output, 0 on failure)
+	InputTokens          int     `json:"inputTokens,omitempty"`         // Input tokens used for accounting
+	OutputTokens         int     `json:"outputTokens,omitempty"`        // Output tokens used for accounting
+	Credits              float64 `json:"credits"`                       // Credits consumed (0 on failure)
+	Duration             int64   `json:"duration"`                      // Request duration in ms
+	TTFT                 int64   `json:"ttft,omitempty"`                // Time to first upstream content/tool event in ms
+	PayloadBytes         int     `json:"payloadBytes,omitempty"`        // Serialized primary Kiro payload size
+	HistoryBytes         int     `json:"historyBytes,omitempty"`        // Serialized history portion
+	ToolDefinitionBytes  int     `json:"toolDefinitionBytes,omitempty"` // Serialized current tool definitions
+	ToolResultBytes      int     `json:"toolResultBytes,omitempty"`     // Serialized current tool results
+	ToolDefinitionCount  int     `json:"toolDefinitionCount,omitempty"`
+	ToolResultCount      int     `json:"toolResultCount,omitempty"`
+	AuxiliaryPurpose     string  `json:"auxiliaryPurpose,omitempty"` // controller/structured_output
+	AuxiliaryModel       string  `json:"auxiliaryModel,omitempty"`
+	AuxiliaryOutcome     string  `json:"auxiliaryOutcome,omitempty"`
+	AuxiliaryInputTokens int     `json:"auxiliaryInputTokens,omitempty"`
+	AuxiliaryCredits     float64 `json:"auxiliaryCredits,omitempty"`
+	AuxiliaryTTFT        int64   `json:"auxiliaryTtft,omitempty"`
 }
 
 const requestLogsMaxSize = 500
@@ -981,6 +987,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		firstMetrics := kiroCallMetrics{upstreamUsage: h.upstreamUsage}
 		secondMetrics := kiroCallMetrics{upstreamUsage: h.upstreamUsage}
+		auxiliaryMetrics := requestAuxiliaryMetrics{}
 		controllerAttempted := false
 		controllerOutcome := claudeControllerNotApplicable
 		structuredOutputRequested := payload != nil && payload.StructuredOutputToolName != ""
@@ -1328,9 +1335,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		firstOutputContent, _ := extractThinkingFromContent(rawContentBuilder.String())
 		if structuredOutputRequested && structuredOutputContent == "" && len(toolUses) == 0 {
 			structuredRetryAttempted = true
+			auxiliaryMetrics.Purpose = "structured_output"
+			auxiliaryMetrics.Model = model
 			logger.Infof("[ClaudeStructuredOutput] conversation=%s model=%s stream=true action=retry", claudeConversationLogID(payload), model)
 			retryOutput, retryErr := callClaudeStructuredOutputRetry(account, payload, firstOutputContent, model, &secondMetrics)
 			if retryErr != nil {
+				auxiliaryMetrics.Outcome = "failed"
 				logger.Warnf(
 					"[ClaudeStructuredOutput] conversation=%s model=%s stream=true outcome=failed error=%v",
 					claudeConversationLogID(payload),
@@ -1343,6 +1353,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					structuredOutputContent = coerced
 				}
 			} else {
+				auxiliaryMetrics.Outcome = "success"
 				structuredOutputContent = retryOutput
 				logger.Infof("[ClaudeStructuredOutput] conversation=%s model=%s stream=true outcome=success", claudeConversationLogID(payload), model)
 			}
@@ -1357,18 +1368,22 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if shouldRunClaudeToolController(payload, toolUses) {
 			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
-				logger.Infof("[ClaudeToolController] conversation=%s model=%s stream=true action=verify", claudeConversationLogID(payload), model)
+				controllerModel := currentMessageModelID(controllerPayload)
+				auxiliaryMetrics.Purpose = "controller"
+				auxiliaryMetrics.Model = controllerModel
+				logger.Infof("[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true action=verify", claudeConversationLogID(payload), model, controllerModel)
 				var controllerToolUses []KiroToolUse
-				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(model, nil, func(toolUse KiroToolUse) {
+				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(controllerModel, nil, func(toolUse KiroToolUse) {
 					controllerToolUses = append(controllerToolUses, toolUse)
 				}))
 				if controllerErr != nil {
 					h.handleAccountFailure(account, controllerErr)
 					controllerOutcome = claudeControllerUpstreamError
 					logger.Warnf(
-						"[ClaudeToolController] conversation=%s model=%s stream=true outcome=%s error_type=%s",
+						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true outcome=%s error_type=%s",
 						claudeConversationLogID(payload),
 						model,
+						controllerModel,
 						controllerOutcome,
 						classifyError(controllerErr.Error()),
 					)
@@ -1379,13 +1394,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 						onToolUse(toolUse)
 					}
 					logger.Infof(
-						"[ClaudeToolController] conversation=%s model=%s stream=true outcome=%s tool_count=%d",
+						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=true outcome=%s tool_count=%d",
 						claudeConversationLogID(payload),
 						model,
+						controllerModel,
 						controllerOutcome,
 						len(realToolUses),
 					)
 				}
+				auxiliaryMetrics.Outcome = string(controllerOutcome)
 			}
 		}
 
@@ -1393,6 +1410,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		secondInputTokens := 0
 		if controllerAttempted || structuredRetryAttempted {
 			secondInputTokens = secondMetrics.effectiveInputTokens(0)
+			auxiliaryMetrics.InputTokens = secondInputTokens
+			auxiliaryMetrics.Credits = secondMetrics.credits
+			auxiliaryMetrics.TTFT = secondMetrics.ttft()
 		}
 		inputTokens := firstInputTokens + secondInputTokens
 		credits := firstMetrics.credits + secondMetrics.credits
@@ -1439,6 +1459,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			time.Since(reqStart).Milliseconds(),
 			firstMetrics.ttftFrom(reqStart),
 			payloadMetrics,
+			auxiliaryMetrics,
 		)
 
 		stopReason := "end_turn"
@@ -1582,7 +1603,7 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID, apiKeyID 
 // recordSuccessLog records a successful request in the request logs.
 // apiKeyID attributes the request to the API key entry that issued it (see above).
 func (h *Handler) recordSuccessLog(endpoint, model, accountID, apiKeyID string, tokens int, credits float64, durationMs int64) {
-	h.recordSuccessLogWithMetrics(endpoint, model, accountID, apiKeyID, tokens, 0, credits, durationMs, 0, requestPayloadMetrics{})
+	h.recordSuccessLogWithMetrics(endpoint, model, accountID, apiKeyID, tokens, 0, credits, durationMs, 0, requestPayloadMetrics{}, requestAuxiliaryMetrics{})
 }
 
 func (h *Handler) recordSuccessLogWithMetrics(
@@ -1591,26 +1612,33 @@ func (h *Handler) recordSuccessLogWithMetrics(
 	credits float64,
 	durationMs, ttftMs int64,
 	payload requestPayloadMetrics,
+	auxiliary requestAuxiliaryMetrics,
 ) {
 	entry := RequestLog{
-		Time:                time.Now().Unix(),
-		Endpoint:            endpoint,
-		Model:               model,
-		AccountID:           accountID,
-		ApiKeyID:            apiKeyID,
-		Status:              "success",
-		Tokens:              inputTokens + outputTokens,
-		InputTokens:         inputTokens,
-		OutputTokens:        outputTokens,
-		Credits:             credits,
-		Duration:            durationMs,
-		TTFT:                ttftMs,
-		PayloadBytes:        payload.PayloadBytes,
-		HistoryBytes:        payload.HistoryBytes,
-		ToolDefinitionBytes: payload.ToolDefinitionBytes,
-		ToolResultBytes:     payload.ToolResultBytes,
-		ToolDefinitionCount: payload.ToolDefinitionCount,
-		ToolResultCount:     payload.ToolResultCount,
+		Time:                 time.Now().Unix(),
+		Endpoint:             endpoint,
+		Model:                model,
+		AccountID:            accountID,
+		ApiKeyID:             apiKeyID,
+		Status:               "success",
+		Tokens:               inputTokens + outputTokens,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		Credits:              credits,
+		Duration:             durationMs,
+		TTFT:                 ttftMs,
+		PayloadBytes:         payload.PayloadBytes,
+		HistoryBytes:         payload.HistoryBytes,
+		ToolDefinitionBytes:  payload.ToolDefinitionBytes,
+		ToolResultBytes:      payload.ToolResultBytes,
+		ToolDefinitionCount:  payload.ToolDefinitionCount,
+		ToolResultCount:      payload.ToolResultCount,
+		AuxiliaryPurpose:     auxiliary.Purpose,
+		AuxiliaryModel:       auxiliary.Model,
+		AuxiliaryOutcome:     auxiliary.Outcome,
+		AuxiliaryInputTokens: auxiliary.InputTokens,
+		AuxiliaryCredits:     auxiliary.Credits,
+		AuxiliaryTTFT:        auxiliary.TTFT,
 	}
 
 	h.appendRequestLog(entry)
@@ -1685,6 +1713,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var toolUses []KiroToolUse
 		firstMetrics := kiroCallMetrics{upstreamUsage: h.upstreamUsage}
 		secondMetrics := kiroCallMetrics{upstreamUsage: h.upstreamUsage}
+		auxiliaryMetrics := requestAuxiliaryMetrics{}
 		controllerAttempted := false
 		controllerOutcome := claudeControllerNotApplicable
 		structuredOutputRequested := payload != nil && payload.StructuredOutputToolName != ""
@@ -1719,9 +1748,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		firstOutputContent, _ := extractThinkingFromContent(content)
 		if structuredOutputRequested && structuredOutputContent == "" && len(toolUses) == 0 {
 			structuredRetryAttempted = true
+			auxiliaryMetrics.Purpose = "structured_output"
+			auxiliaryMetrics.Model = model
 			logger.Infof("[ClaudeStructuredOutput] conversation=%s model=%s stream=false action=retry", claudeConversationLogID(payload), model)
 			retryOutput, retryErr := callClaudeStructuredOutputRetry(account, payload, firstOutputContent, model, &secondMetrics)
 			if retryErr != nil {
+				auxiliaryMetrics.Outcome = "failed"
 				logger.Warnf(
 					"[ClaudeStructuredOutput] conversation=%s model=%s stream=false outcome=failed error=%v",
 					claudeConversationLogID(payload),
@@ -1734,6 +1766,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 					structuredOutputContent = coerced
 				}
 			} else {
+				auxiliaryMetrics.Outcome = "success"
 				structuredOutputContent = retryOutput
 				logger.Infof("[ClaudeStructuredOutput] conversation=%s model=%s stream=false outcome=success", claudeConversationLogID(payload), model)
 			}
@@ -1741,18 +1774,22 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if shouldRunClaudeToolController(payload, toolUses) {
 			if controllerPayload := buildClaudeToolControllerPayload(payload, firstOutputContent); controllerPayload != nil {
 				controllerAttempted = true
-				logger.Infof("[ClaudeToolController] conversation=%s model=%s stream=false action=verify", claudeConversationLogID(payload), model)
+				controllerModel := currentMessageModelID(controllerPayload)
+				auxiliaryMetrics.Purpose = "controller"
+				auxiliaryMetrics.Model = controllerModel
+				logger.Infof("[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false action=verify", claudeConversationLogID(payload), model, controllerModel)
 				var controllerToolUses []KiroToolUse
-				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(model, nil, func(toolUse KiroToolUse) {
+				controllerErr := CallKiroAPI(account, controllerPayload, secondMetrics.callback(controllerModel, nil, func(toolUse KiroToolUse) {
 					controllerToolUses = append(controllerToolUses, toolUse)
 				}))
 				if controllerErr != nil {
 					h.handleAccountFailure(account, controllerErr)
 					controllerOutcome = claudeControllerUpstreamError
 					logger.Warnf(
-						"[ClaudeToolController] conversation=%s model=%s stream=false outcome=%s error_type=%s",
+						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false outcome=%s error_type=%s",
 						claudeConversationLogID(payload),
 						model,
+						controllerModel,
 						controllerOutcome,
 						classifyError(controllerErr.Error()),
 					)
@@ -1761,13 +1798,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 					realToolUses, controllerOutcome = splitClaudeControllerToolUses(controllerPayload, controllerToolUses)
 					toolUses = append(toolUses, realToolUses...)
 					logger.Infof(
-						"[ClaudeToolController] conversation=%s model=%s stream=false outcome=%s tool_count=%d",
+						"[ClaudeToolController] conversation=%s model=%s controller_model=%s stream=false outcome=%s tool_count=%d",
 						claudeConversationLogID(payload),
 						model,
+						controllerModel,
 						controllerOutcome,
 						len(realToolUses),
 					)
 				}
+				auxiliaryMetrics.Outcome = string(controllerOutcome)
 			}
 		}
 
@@ -1790,6 +1829,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		secondInputTokens := 0
 		if controllerAttempted || structuredRetryAttempted {
 			secondInputTokens = secondMetrics.effectiveInputTokens(0)
+			auxiliaryMetrics.InputTokens = secondInputTokens
+			auxiliaryMetrics.Credits = secondMetrics.credits
+			auxiliaryMetrics.TTFT = secondMetrics.ttft()
 		}
 		inputTokens := firstInputTokens + secondInputTokens
 		credits := firstMetrics.credits + secondMetrics.credits
@@ -1823,6 +1865,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			time.Since(reqStart).Milliseconds(),
 			firstMetrics.ttftFrom(reqStart),
 			payloadMetrics,
+			auxiliaryMetrics,
 		)
 
 		responseThinkingContent := rawThinkingContent

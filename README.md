@@ -134,6 +134,7 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `KIRO_CLAUDE_CONTROLLER_MODEL` | Model used only for Claude Code continuation decisions; use `same` to keep the primary model | `same` |
 
 ## Contributing
 
