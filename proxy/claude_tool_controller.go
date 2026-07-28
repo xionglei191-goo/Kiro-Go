@@ -526,7 +526,7 @@ func compactClaudeControllerHistory(
 		placeholder...,
 	)
 	runningBytes := payloadByteSize(payload)
-	runningTokens := estimateKiroPayloadTokens(payload)
+	runningTokens := estimateClaudeControllerPayloadTokens(payload)
 	keepFrom := len(conversation)
 
 	for i := len(conversation) - 1; i >= 0; i-- {
@@ -555,10 +555,10 @@ func claudeControllerPayloadFits(payload *KiroPayload, inputTokenLimit, payloadB
 		return false
 	}
 	return payloadByteSize(payload) <= payloadByteLimit &&
-		estimateKiroPayloadTokens(payload) <= inputTokenLimit
+		estimateClaudeControllerPayloadTokens(payload) <= inputTokenLimit
 }
 
-func estimateKiroPayloadTokens(payload *KiroPayload) int {
+func estimateClaudeControllerPayloadTokens(payload *KiroPayload) int {
 	if payload == nil {
 		return 0
 	}

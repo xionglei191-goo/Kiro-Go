@@ -674,7 +674,6 @@ func (p *AccountPool) AvailableCount() int {
 // UpdateStats 更新账号统计
 func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	var updated bool
 	var requestCount, errorCount, totalTokens int
 	var totalCredits float64
@@ -702,8 +701,13 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 			p.accounts[i].LastUsed = lastUsed
 		}
 	}
+	p.mu.Unlock()
+
 	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		// Persist after releasing the pool lock so config and pool locks never nest.
+		// Completing the write before returning also prevents stale async writes
+		// from racing with a later config reload.
+		_ = config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
 	}
 }
 

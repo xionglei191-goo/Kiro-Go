@@ -307,7 +307,7 @@ func TestClaudeControllerCompactsOversizedHistoryToAuxiliaryLimit(t *testing.T) 
 		t.Fatalf("controller payload size = %d, limit = %d", got, claudeControllerMaxPayloadBytes)
 	}
 	tokenBudget := claudeControllerInputTokenBudget(payload, false)
-	if got := estimateKiroPayloadTokens(controller); got > tokenBudget {
+	if got := estimateClaudeControllerPayloadTokens(controller); got > tokenBudget {
 		t.Fatalf("controller token estimate = %d, limit = %d", got, tokenBudget)
 	}
 	if primarySize <= claudeControllerMaxPayloadBytes {
@@ -382,7 +382,7 @@ func TestClaudeControllerCompactsByTokenDensityBeforeByteLimit(t *testing.T) {
 		t.Fatal("expected controller payload")
 	}
 	tokenBudget := claudeControllerInputTokenBudget(payload, false)
-	if got := estimateKiroPayloadTokens(controller); got > tokenBudget {
+	if got := estimateClaudeControllerPayloadTokens(controller); got > tokenBudget {
 		t.Fatalf("controller token estimate = %d, limit = %d", got, tokenBudget)
 	}
 	if got := payloadByteSize(controller); got > claudeControllerMaxPayloadBytes {
@@ -499,7 +499,7 @@ func TestClaudeControllerRetriesOnceWithFallbackBudgetOnContentLength(t *testing
 		t.Fatalf("expected initial call plus one compact retry, got %d", len(requests))
 	}
 	fallbackTokenBudget := claudeControllerInputTokenBudget(source, true)
-	if got := estimateKiroPayloadTokens(usedPayload); got > fallbackTokenBudget {
+	if got := estimateClaudeControllerPayloadTokens(usedPayload); got > fallbackTokenBudget {
 		t.Fatalf("fallback token estimate = %d, limit = %d", got, fallbackTokenBudget)
 	}
 	if got := payloadByteSize(usedPayload); got > claudeControllerFallbackPayloadBytes {
@@ -994,9 +994,9 @@ func runClaudeControllerHandlerTest(
 		mutate(payload)
 	}
 	if stream {
-		handler.handleClaudeStream(recorder, payload, "claude-opus-5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+		handler.handleClaudeStream(recorder, payload, "claude-opus-5", false, claudeThinkingResponseOptions{}, 1, nil, "", nil, false)
 	} else {
-		handler.handleClaudeNonStream(recorder, payload, "claude-opus-5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+		handler.handleClaudeNonStream(recorder, payload, "claude-opus-5", false, claudeThinkingResponseOptions{}, 1, nil, "", nil, false)
 	}
 
 	mu.Lock()
