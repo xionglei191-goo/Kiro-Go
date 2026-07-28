@@ -16,14 +16,14 @@ const (
 	claudeControllerWaitToolBase    = "kiroGoWaitForUser"
 	claudeControllerModelEnv        = "KIRO_CLAUDE_CONTROLLER_MODEL"
 	claudeControllerMaxTokens       = 1024
-	claudeControllerMaxPayloadBytes = 320 * 1024
+	claudeControllerMaxPayloadBytes = 512 * 1024
 
-	claudeControllerTokenBudgetPercent         = 45
-	claudeControllerTokenBudgetCap             = 150_000
-	claudeControllerFallbackPayloadBytes       = 192 * 1024
+	claudeControllerTokenBudgetPercent         = 75
+	claudeControllerTokenBudgetCap             = 300_000
+	claudeControllerFallbackPayloadBytes       = 320 * 1024
 	claudeControllerFallbackMaxTokens          = 256
-	claudeControllerFallbackTokenBudgetPercent = 25
-	claudeControllerFallbackTokenBudgetCap     = 75_000
+	claudeControllerFallbackTokenBudgetPercent = 45
+	claudeControllerFallbackTokenBudgetCap     = 150_000
 )
 
 type claudeControllerOutcome string

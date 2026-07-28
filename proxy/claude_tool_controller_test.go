@@ -287,73 +287,6 @@ func TestClaudeControllerCompactsOversizedHistoryToAuxiliaryLimit(t *testing.T) 
 	}
 }
 
-func TestClaudeControllerCompactsBelowLegacyPayloadLimitForLatency(t *testing.T) {
-	t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
-	payload := claudeToolControllerTestPayload()
-	payload.ControllerOriginalTask = "Deploy the service and verify every remaining check."
-	payload.ConversationState.History = []KiroHistoryMessage{
-		{
-			UserInputMessage: &KiroUserInputMessage{
-				Content: "system instructions",
-				ModelID: "claude-opus-5",
-				Origin:  "AI_EDITOR",
-			},
-		},
-		{
-			AssistantResponseMessage: &KiroAssistantResponseMessage{
-				Content: "I will follow these instructions.",
-			},
-		},
-		{
-			UserInputMessage: &KiroUserInputMessage{
-				Content: "Inspect the previous deployment output.",
-				ModelID: "claude-opus-5",
-				Origin:  "AI_EDITOR",
-			},
-		},
-		{
-			AssistantResponseMessage: &KiroAssistantResponseMessage{
-				Content: strings.Repeat("x", 360*1024),
-			},
-		},
-	}
-	payload.ConversationState.CurrentMessage.UserInputMessage.Content =
-		"The service restarted and the health check is now pending."
-
-	const legacyPayloadLimit = 512 * 1024
-	sourceSize := payloadByteSize(payload)
-	if sourceSize <= claudeControllerMaxPayloadBytes || sourceSize >= legacyPayloadLimit {
-		t.Fatalf(
-			"test payload size = %d, want between low-latency limit %d and legacy limit %d",
-			sourceSize,
-			claudeControllerMaxPayloadBytes,
-			legacyPayloadLimit,
-		)
-	}
-
-	controller := buildClaudeToolControllerPayload(payload, "Wait for the health result, then continue.")
-	if controller == nil {
-		t.Fatal("expected controller payload")
-	}
-	if got := payloadByteSize(controller); got > claudeControllerMaxPayloadBytes {
-		t.Fatalf("controller payload size = %d, limit = %d", got, claudeControllerMaxPayloadBytes)
-	}
-	if got := estimateKiroPayloadTokens(controller); got > claudeControllerInputTokenBudget(payload, false) {
-		t.Fatalf("controller token estimate = %d, exceeds low-latency budget", got)
-	}
-
-	prompt := controller.ConversationState.CurrentMessage.UserInputMessage.Content
-	for _, retained := range []string{
-		"Deploy the service and verify every remaining check.",
-		"The service restarted and the health check is now pending.",
-		"Wait for the health result, then continue.",
-	} {
-		if !strings.Contains(prompt, retained) {
-			t.Fatalf("controller prompt lost latency-compaction anchor %q", retained)
-		}
-	}
-}
-
 func TestClaudeControllerCompactsByTokenDensityBeforeByteLimit(t *testing.T) {
 	t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
 	payload := claudeToolControllerTestPayload()
@@ -372,7 +305,7 @@ func TestClaudeControllerCompactsByTokenDensityBeforeByteLimit(t *testing.T) {
 			},
 		},
 	}
-	denseTurn := strings.Repeat("{}[],:;!@#$%^&*", 1800)
+	denseTurn := strings.Repeat("{}[],:;!@#$%^&*", 2500)
 	for i := 0; i < 4; i++ {
 		payload.ConversationState.History = append(
 			payload.ConversationState.History,
@@ -538,22 +471,22 @@ func TestClaudeControllerTokenBudgetTracksControllerModelWindow(t *testing.T) {
 
 	t.Run("haiku 200k window", func(t *testing.T) {
 		t.Setenv(claudeControllerModelEnv, "claude-haiku-4.5")
-		if got := claudeControllerInputTokenBudget(payload, false); got != 90_000 {
-			t.Fatalf("normal Haiku budget = %d, want 90000", got)
+		if got := claudeControllerInputTokenBudget(payload, false); got != 150_000 {
+			t.Fatalf("normal Haiku budget = %d, want 150000", got)
 		}
-		if got := claudeControllerInputTokenBudget(payload, true); got != 50_000 {
-			t.Fatalf("fallback Haiku budget = %d, want 50000", got)
+		if got := claudeControllerInputTokenBudget(payload, true); got != 90_000 {
+			t.Fatalf("fallback Haiku budget = %d, want 90000", got)
 		}
 	})
 
 	t.Run("opus 1m window is capped", func(t *testing.T) {
 		t.Setenv(claudeControllerModelEnv, "same")
 		payload.ConversationState.CurrentMessage.UserInputMessage.ModelID = "claude-opus-4.8"
-		if got := claudeControllerInputTokenBudget(payload, false); got != 150_000 {
-			t.Fatalf("normal Opus budget = %d, want 150000", got)
+		if got := claudeControllerInputTokenBudget(payload, false); got != 300_000 {
+			t.Fatalf("normal Opus budget = %d, want 300000", got)
 		}
-		if got := claudeControllerInputTokenBudget(payload, true); got != 75_000 {
-			t.Fatalf("fallback Opus budget = %d, want 75000", got)
+		if got := claudeControllerInputTokenBudget(payload, true); got != 150_000 {
+			t.Fatalf("fallback Opus budget = %d, want 150000", got)
 		}
 	})
 }
