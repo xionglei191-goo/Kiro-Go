@@ -414,22 +414,25 @@ func TestClaudeControllerRetriesOnceWithFallbackBudgetOnContentLength(t *testing
 		AccessToken: "token",
 		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
 	}
-	var attempts []bool
-	usedPayload, toolUses, retried, err := callClaudeToolControllerWithFallback(
+	var attempts []claudeControllerRetryReason
+	usedPayload, toolUses, retryReason, err := callClaudeToolControllerWithFallback(
 		account,
 		source,
 		"More checks remain.",
 		initial,
 		&kiroCallMetrics{},
-		func(_ *KiroPayload, fallback bool) {
-			attempts = append(attempts, fallback)
+		func(_ *KiroPayload, reason claudeControllerRetryReason) {
+			attempts = append(attempts, reason)
 		},
 	)
 	if err != nil {
 		t.Fatalf("controller fallback failed: %v", err)
 	}
-	if !retried || len(attempts) != 2 || attempts[0] || !attempts[1] {
-		t.Fatalf("unexpected fallback attempts: retried=%t attempts=%v", retried, attempts)
+	if retryReason != claudeControllerRetryContentLength ||
+		len(attempts) != 2 ||
+		attempts[0] != claudeControllerNoRetry ||
+		attempts[1] != claudeControllerRetryContentLength {
+		t.Fatalf("unexpected fallback attempts: reason=%s attempts=%v", retryReason, attempts)
 	}
 	mu.Lock()
 	unexpectedCalls := unexpectedFallbackCalls
@@ -449,6 +452,16 @@ func TestClaudeControllerRetriesOnceWithFallbackBudgetOnContentLength(t *testing
 	}
 	if len(toolUses) != 1 || toolUses[0].Name != "Bash" {
 		t.Fatalf("fallback tool result was not returned: %#v", toolUses)
+	}
+	if usedPayload.InferenceConfig == nil ||
+		usedPayload.InferenceConfig.MaxTokens != claudeControllerFallbackMaxTokens {
+		t.Fatalf("fallback max tokens were not tightened: %#v", usedPayload.InferenceConfig)
+	}
+	if !strings.Contains(
+		usedPayload.ConversationState.CurrentMessage.UserInputMessage.Content,
+		"final controller decision attempt",
+	) {
+		t.Fatal("fallback controller prompt was not tightened")
 	}
 }
 
@@ -627,50 +640,99 @@ func TestClaudeHandlersControllerContinuesWithRealTool(t *testing.T) {
 	}
 }
 
-func TestClaudeHandlersControllerStopsAfterUndecidedOrError(t *testing.T) {
-	tests := []struct {
-		name       string
-		secondCall []byte
-	}{
-		{
-			name: "undecided text",
-			secondCall: awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-				"content": "I still decline to choose a tool.",
-			}),
-		},
-		{
-			name:       "truncated upstream stream",
-			secondCall: []byte{0x01},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			recorder, requests := runClaudeControllerHandlerTest(t, true, func(call int, _ KiroPayload) []byte {
-				if call == 1 {
+func TestClaudeHandlersControllerRetriesUndecidedDecision(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			recorder, requests := runClaudeControllerHandlerTest(t, stream, func(call int, _ KiroPayload) []byte {
+				switch call {
+				case 1:
 					return awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-						"content": "Original response.",
+						"content":     "Original response.",
+						"inputTokens": 100,
 					})
+				case 2:
+					return awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+						"content":     "I still decline to choose a tool.",
+						"inputTokens": 120,
+					})
+				case 3:
+					return awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+						"toolUseId":   "toolu_retry_decision",
+						"name":        "Bash",
+						"input":       `{"command":"continue-work"}`,
+						"stop":        true,
+						"inputTokens": 80,
+					})
+				default:
+					return nil
 				}
-				if call == 2 {
-					return tt.secondCall
-				}
-				return nil
 			})
 
-			if len(requests) != 2 {
-				t.Fatalf("controller must make at most one decision request, got %d", len(requests))
+			if len(requests) != 3 {
+				t.Fatalf("expected one strict decision retry, got %d requests", len(requests))
 			}
+			retry := requests[2]
+			if retry.InferenceConfig == nil ||
+				retry.InferenceConfig.MaxTokens != claudeControllerFallbackMaxTokens ||
+				!strings.Contains(
+					retry.ConversationState.CurrentMessage.UserInputMessage.Content,
+					"final controller decision attempt",
+				) {
+				t.Fatalf("strict controller retry was not applied: %#v", retry)
+			}
+
 			body := recorder.Body.String()
-			if !strings.Contains(body, `"stop_reason":"end_turn"`) ||
-				!strings.Contains(body, "Original response.") {
-				t.Fatalf("controller fallback did not preserve the original response: %s", body)
+			if !strings.Contains(body, `"stop_reason":"tool_use"`) ||
+				!strings.Contains(body, "toolu_retry_decision") {
+				t.Fatalf("strict retry did not recover the tool call: %s", body)
 			}
-			if strings.Contains(body, "I still decline to choose a tool.") ||
-				strings.Contains(body, "event: error") {
-				t.Fatalf("controller fallback leaked its internal failure: %s", body)
+			if stream {
+				if !strings.Contains(body, `"input_tokens":300`) {
+					t.Fatalf("stream did not aggregate both controller attempts: %s", body)
+				}
+			} else {
+				var response ClaudeResponse
+				if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+					t.Fatalf("decode response: %v", err)
+				}
+				if response.Usage.InputTokens != 300 {
+					t.Fatalf("controller retry usage = %#v, want 300 input tokens", response.Usage)
+				}
+			}
+			if strings.Contains(body, "I still decline to choose a tool.") {
+				t.Fatalf("controller retry text leaked to the client: %s", body)
 			}
 		})
+	}
+}
+
+func TestClaudeHandlerStopsAfterNonRetryableControllerError(t *testing.T) {
+	recorder, requests := runClaudeControllerHandlerTest(t, true, func(call int, _ KiroPayload) []byte {
+		if call == 1 {
+			return awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+				"content": "Original response.",
+			})
+		}
+		if call == 2 {
+			return []byte{0x01}
+		}
+		return nil
+	})
+
+	if len(requests) != 2 {
+		t.Fatalf("non-retryable controller error made extra requests: %d", len(requests))
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) ||
+		!strings.Contains(body, "Original response.") {
+		t.Fatalf("controller error did not preserve original response: %s", body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("controller internal error leaked to the client: %s", body)
 	}
 }
 

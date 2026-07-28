@@ -21,11 +21,13 @@ const (
 	claudeControllerTokenBudgetPercent         = 75
 	claudeControllerTokenBudgetCap             = 300_000
 	claudeControllerFallbackPayloadBytes       = 320 * 1024
+	claudeControllerFallbackMaxTokens          = 256
 	claudeControllerFallbackTokenBudgetPercent = 45
 	claudeControllerFallbackTokenBudgetCap     = 150_000
 )
 
 type claudeControllerOutcome string
+type claudeControllerRetryReason string
 
 const (
 	claudeControllerNotApplicable claudeControllerOutcome = "not_applicable"
@@ -34,6 +36,10 @@ const (
 	claudeControllerWaitForUser   claudeControllerOutcome = "wait_for_user"
 	claudeControllerUndecided     claudeControllerOutcome = "undecided"
 	claudeControllerUpstreamError claudeControllerOutcome = "upstream_error"
+
+	claudeControllerNoRetry            claudeControllerRetryReason = ""
+	claudeControllerRetryContentLength claudeControllerRetryReason = "content_length"
+	claudeControllerRetryUndecided     claudeControllerRetryReason = "undecided"
 )
 
 type kiroCallMetrics struct {
@@ -112,6 +118,41 @@ func (m kiroCallMetrics) effectiveInputTokens(fallback int) int {
 	return fallback
 }
 
+func (m *kiroCallMetrics) mergeAttempt(attempt kiroCallMetrics) {
+	if m.startedAt.IsZero() ||
+		(!attempt.startedAt.IsZero() && attempt.startedAt.Before(m.startedAt)) {
+		m.startedAt = attempt.startedAt
+	}
+	if m.firstContentAt.IsZero() ||
+		(!attempt.firstContentAt.IsZero() && attempt.firstContentAt.Before(m.firstContentAt)) {
+		m.firstContentAt = attempt.firstContentAt
+	}
+	m.inputTokens += attempt.inputTokens
+	m.realInputTokens += attempt.realInputTokens
+	m.credits += attempt.credits
+
+	attemptHasUsage := attempt.usage.InputTokens > 0 ||
+		attempt.usage.OutputTokens > 0 ||
+		attempt.usage.InputBreakdownAvailable
+	if !attemptHasUsage {
+		return
+	}
+	currentHasUsage := m.usage.InputTokens > 0 ||
+		m.usage.OutputTokens > 0 ||
+		m.usage.InputBreakdownAvailable
+	if !currentHasUsage {
+		m.usage = attempt.usage
+		return
+	}
+	m.usage.InputTokens += attempt.usage.InputTokens
+	m.usage.OutputTokens += attempt.usage.OutputTokens
+	m.usage.UncachedInputTokens += attempt.usage.UncachedInputTokens
+	m.usage.CacheReadInputTokens += attempt.usage.CacheReadInputTokens
+	m.usage.CacheCreationInputTokens += attempt.usage.CacheCreationInputTokens
+	m.usage.InputBreakdownAvailable =
+		m.usage.InputBreakdownAvailable && attempt.usage.InputBreakdownAvailable
+}
+
 func shouldRunClaudeToolController(payload *KiroPayload, toolUses []KiroToolUse) bool {
 	return payload != nil &&
 		payload.ClaudeCodeAgent &&
@@ -170,6 +211,7 @@ func buildClaudeToolControllerPayload(payload *KiroPayload, assistantContent str
 		assistantContent,
 		tokenBudget,
 		claudeControllerMaxPayloadBytes,
+		false,
 	)
 }
 
@@ -180,6 +222,7 @@ func buildClaudeToolControllerFallbackPayload(payload *KiroPayload, assistantCon
 		assistantContent,
 		tokenBudget,
 		claudeControllerFallbackPayloadBytes,
+		true,
 	)
 }
 
@@ -209,6 +252,7 @@ func buildClaudeToolControllerPayloadWithBudget(
 	assistantContent string,
 	inputTokenLimit int,
 	payloadByteLimit int,
+	strictDecision bool,
 ) *KiroPayload {
 	if payload == nil || !payload.ClaudeCodeAgent {
 		return nil
@@ -277,6 +321,12 @@ func buildClaudeToolControllerPayloadWithBudget(
 		controller.ControllerWaitToolName,
 		payload.ClaudeToolChoiceRequired,
 	)
+	if strictDecision {
+		basePrompt += `
+
+This is the final controller decision attempt. A text-only response is invalid.
+Invoke one or more provided tools now. Do not emit analysis, explanation, or any other text.`
+	}
 	controller.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: basePrompt,
 		ModelID: resolveClaudeControllerModel(originalCurrent.ModelID),
@@ -288,9 +338,13 @@ func buildClaudeToolControllerPayloadWithBudget(
 	if controller.InferenceConfig == nil {
 		controller.InferenceConfig = &InferenceConfig{}
 	}
+	maxTokens := claudeControllerMaxTokens
+	if strictDecision {
+		maxTokens = claudeControllerFallbackMaxTokens
+	}
 	if controller.InferenceConfig.MaxTokens <= 0 ||
-		controller.InferenceConfig.MaxTokens > claudeControllerMaxTokens {
-		controller.InferenceConfig.MaxTokens = claudeControllerMaxTokens
+		controller.InferenceConfig.MaxTokens > maxTokens {
+		controller.InferenceConfig.MaxTokens = maxTokens
 	}
 
 	applyClaudeControllerContextBudget(
@@ -613,35 +667,50 @@ func callClaudeToolControllerWithFallback(
 	assistantContent string,
 	controllerPayload *KiroPayload,
 	metrics *kiroCallMetrics,
-	onAttempt func(payload *KiroPayload, fallback bool),
-) (*KiroPayload, []KiroToolUse, bool, error) {
+	onAttempt func(payload *KiroPayload, retryReason claudeControllerRetryReason),
+) (*KiroPayload, []KiroToolUse, claudeControllerRetryReason, error) {
 	if controllerPayload == nil {
-		return nil, nil, false, fmt.Errorf("controller payload is nil")
+		return nil, nil, claudeControllerNoRetry, fmt.Errorf("controller payload is nil")
 	}
 
-	call := func(attemptPayload *KiroPayload, fallback bool) ([]KiroToolUse, error) {
+	call := func(
+		attemptPayload *KiroPayload,
+		retryReason claudeControllerRetryReason,
+	) ([]KiroToolUse, error) {
 		if onAttempt != nil {
-			onAttempt(attemptPayload, fallback)
+			onAttempt(attemptPayload, retryReason)
 		}
 		var toolUses []KiroToolUse
 		model := currentMessageModelID(attemptPayload)
-		err := CallKiroAPI(account, attemptPayload, metrics.callback(model, nil, func(toolUse KiroToolUse) {
+		attemptMetrics := kiroCallMetrics{upstreamUsage: metrics.upstreamUsage}
+		err := CallKiroAPI(account, attemptPayload, attemptMetrics.callback(model, nil, func(toolUse KiroToolUse) {
 			toolUses = append(toolUses, toolUse)
 		}))
+		metrics.mergeAttempt(attemptMetrics)
 		return toolUses, err
 	}
 
-	toolUses, err := call(controllerPayload, false)
-	if err == nil || !isContentLengthExceededError(err) {
-		return controllerPayload, toolUses, false, err
+	toolUses, err := call(controllerPayload, claudeControllerNoRetry)
+	retryReason := claudeControllerNoRetry
+	switch {
+	case err != nil && isContentLengthExceededError(err):
+		retryReason = claudeControllerRetryContentLength
+	case err == nil:
+		_, outcome := splitClaudeControllerToolUses(controllerPayload, toolUses)
+		if outcome == claudeControllerUndecided {
+			retryReason = claudeControllerRetryUndecided
+		}
+	}
+	if retryReason == claudeControllerNoRetry {
+		return controllerPayload, toolUses, retryReason, err
 	}
 
 	fallbackPayload := buildClaudeToolControllerFallbackPayload(sourcePayload, assistantContent)
 	if fallbackPayload == nil {
-		return controllerPayload, nil, false, err
+		return controllerPayload, nil, claudeControllerNoRetry, err
 	}
-	toolUses, err = call(fallbackPayload, true)
-	return fallbackPayload, toolUses, true, err
+	toolUses, err = call(fallbackPayload, retryReason)
+	return fallbackPayload, toolUses, retryReason, err
 }
 
 func splitClaudeControllerToolUses(payload *KiroPayload, toolUses []KiroToolUse) ([]KiroToolUse, claudeControllerOutcome) {
