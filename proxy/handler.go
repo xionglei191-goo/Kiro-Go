@@ -965,9 +965,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 		messageStartUsage = cacheUsage
 
-		var inputTokens, outputTokens int
-		var credits float64
-		var realInputTokens int
+		firstMetrics := kiroCallMetrics{}
+		secondMetrics := kiroCallMetrics{}
+		autoContinuationAttempted := false
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1216,69 +1216,58 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			}
 		}
 
-		callback := &KiroStreamCallback{
-			OnText: func(text string, isThinking bool) {
-				if text == "" {
-					return
-				}
-				if isThinking {
-					rawThinkingBuilder.WriteString(text)
-				} else {
-					rawContentBuilder.WriteString(text)
-				}
-				processClaudeText(text, isThinking, false)
-			},
-			OnToolUse: func(tu KiroToolUse) {
-				processClaudeText("", false, true)
-				rawContentBuilder.WriteString(tu.Name)
-				if b, err := json.Marshal(tu.Input); err == nil {
-					rawContentBuilder.Write(b)
-				}
-
-				toolUses = append(toolUses, tu)
-				ensureMessageStart()
-				closeActiveBlock()
-
-				idx := nextContentIndex
-				nextContentIndex++
-
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-					"type":  "content_block_start",
-					"index": idx,
-					"content_block": map[string]interface{}{
-						"type":  "tool_use",
-						"id":    tu.ToolUseID,
-						"name":  tu.Name,
-						"input": map[string]interface{}{},
-					},
-				})
-
-				inputJSON, _ := json.Marshal(tu.Input)
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": idx,
-					"delta": map[string]interface{}{
-						"type":         "input_json_delta",
-						"partial_json": string(inputJSON),
-					},
-				})
-
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-					"type":  "content_block_stop",
-					"index": idx,
-				})
-			},
-			OnComplete: func(inTok, outTok int) {
-				inputTokens = inTok
-				outputTokens = outTok
-			},
-			OnCredits: func(c float64) {
-				credits = c
-			},
-			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-			},
+		onText := func(text string, isThinking bool) {
+			if text == "" {
+				return
+			}
+			if isThinking {
+				rawThinkingBuilder.WriteString(text)
+			} else {
+				rawContentBuilder.WriteString(text)
+			}
+			processClaudeText(text, isThinking, false)
 		}
+		onToolUse := func(tu KiroToolUse) {
+			processClaudeText("", false, true)
+			rawContentBuilder.WriteString(tu.Name)
+			if b, err := json.Marshal(tu.Input); err == nil {
+				rawContentBuilder.Write(b)
+			}
+
+			toolUses = append(toolUses, tu)
+			ensureMessageStart()
+			closeActiveBlock()
+
+			idx := nextContentIndex
+			nextContentIndex++
+
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    tu.ToolUseID,
+					"name":  tu.Name,
+					"input": map[string]interface{}{},
+				},
+			})
+
+			inputJSON, _ := json.Marshal(tu.Input)
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": string(inputJSON),
+				},
+			})
+
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		}
+		callback := firstMetrics.callback(model, onText, onToolUse)
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
@@ -1302,16 +1291,42 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		closeActiveBlock()
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		firstOutputContent, _ := extractThinkingFromContent(rawContentBuilder.String())
+		if shouldAutoContinueClaudeToolCall(payload, firstOutputContent, toolUses) {
+			if continuationPayload := buildClaudeToolAutoContinuationPayload(payload, firstOutputContent); continuationPayload != nil {
+				autoContinuationAttempted = true
+				logger.Infof("[ClaudeAutoContinue] model=%s stream=true action=attempt", model)
+				continuationErr := CallKiroAPI(account, continuationPayload, secondMetrics.callback(model, onText, onToolUse))
+				processClaudeText("", false, true)
+				if eventThinkingOpen {
+					sendText("", 3)
+				}
+				closeActiveBlock()
+				if continuationErr != nil {
+					h.handleAccountFailure(account, continuationErr)
+					logger.Warnf("[ClaudeAutoContinue] model=%s stream=true outcome=upstream_error error_type=%s", model, classifyError(continuationErr.Error()))
+				} else {
+					outcome := "end_turn"
+					if len(toolUses) > 0 {
+						outcome = "tool_use"
+					}
+					logger.Infof("[ClaudeAutoContinue] model=%s stream=true outcome=%s tool_count=%d", model, outcome, len(toolUses))
+				}
+			}
 		}
+
+		firstInputTokens := firstMetrics.effectiveInputTokens(estimatedInputTokens)
+		secondInputTokens := 0
+		if autoContinuationAttempted {
+			secondInputTokens = secondMetrics.effectiveInputTokens(0)
+		}
+		inputTokens := firstInputTokens + secondInputTokens
+		credits := firstMetrics.credits + secondMetrics.credits
 		// Re-anchor the cache split to the real upstream input total so
 		// input+creation+read stays consistent (cacheUsage was computed against
 		// the pre-call token estimate).
-		if cacheProfile != nil && realInputTokens > 0 {
-			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
+		if cacheProfile != nil && firstMetrics.realInputTokens > 0 {
+			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, firstInputTokens)
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
@@ -1321,7 +1336,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			thinkingOutput = ""
 		}
-		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+		outputTokens := estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1334,6 +1349,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
 		}
+		logger.Debugf("[ClaudeStop] model=%s stream=true stop_reason=%s tool_count=%d auto_continue=%t", model, stopReason, len(toolUses), autoContinuationAttempted)
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -1539,39 +1555,45 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var content string
 		var thinkingContent string
 		var toolUses []KiroToolUse
-		var inputTokens, outputTokens int
-		var credits float64
-		var realInputTokens int
+		firstMetrics := kiroCallMetrics{}
+		secondMetrics := kiroCallMetrics{}
+		autoContinuationAttempted := false
 
-		callback := &KiroStreamCallback{
-			OnText: func(text string, isThinking bool) {
-				if isThinking {
-					thinkingContent += text
-				} else {
-					content += text
-				}
-			},
-			OnToolUse: func(tu KiroToolUse) {
-				toolUses = append(toolUses, tu)
-			},
-			OnComplete: func(inTok, outTok int) {
-				inputTokens = inTok
-				outputTokens = outTok
-			},
-			OnCredits: func(c float64) {
-				credits = c
-			},
-			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-			},
+		onText := func(text string, isThinking bool) {
+			if isThinking {
+				thinkingContent += text
+			} else {
+				content += text
+			}
+		}
+		onToolUse := func(tu KiroToolUse) {
+			toolUses = append(toolUses, tu)
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPI(account, payload, firstMetrics.callback(model, onText, onToolUse))
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
+		}
+
+		firstOutputContent, _ := extractThinkingFromContent(content)
+		if shouldAutoContinueClaudeToolCall(payload, firstOutputContent, toolUses) {
+			if continuationPayload := buildClaudeToolAutoContinuationPayload(payload, firstOutputContent); continuationPayload != nil {
+				autoContinuationAttempted = true
+				logger.Infof("[ClaudeAutoContinue] model=%s stream=false action=attempt", model)
+				if continuationErr := CallKiroAPI(account, continuationPayload, secondMetrics.callback(model, onText, onToolUse)); continuationErr != nil {
+					h.handleAccountFailure(account, continuationErr)
+					logger.Warnf("[ClaudeAutoContinue] model=%s stream=false outcome=upstream_error error_type=%s", model, classifyError(continuationErr.Error()))
+				} else {
+					outcome := "end_turn"
+					if len(toolUses) > 0 {
+						outcome = "tool_use"
+					}
+					logger.Infof("[ClaudeAutoContinue] model=%s stream=false outcome=%s tool_count=%d", model, outcome, len(toolUses))
+				}
+			}
 		}
 
 		thinkingFormat := thinkingOpts.Format
@@ -1584,18 +1606,20 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			rawThinkingContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		firstInputTokens := firstMetrics.effectiveInputTokens(estimatedInputTokens)
+		secondInputTokens := 0
+		if autoContinuationAttempted {
+			secondInputTokens = secondMetrics.effectiveInputTokens(0)
 		}
+		inputTokens := firstInputTokens + secondInputTokens
+		credits := firstMetrics.credits + secondMetrics.credits
 		// Re-anchor the cache split to the real upstream input total so
 		// input+creation+read stays consistent (cacheUsage was computed against
 		// the pre-call token estimate).
-		if cacheProfile != nil && realInputTokens > 0 {
-			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
+		if cacheProfile != nil && firstMetrics.realInputTokens > 0 {
+			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, firstInputTokens)
 		}
-		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+		outputTokens := estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1623,6 +1647,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		logger.Debugf("[ClaudeStop] model=%s stream=false stop_reason=%s tool_count=%d auto_continue=%t", model, resp.StopReason, len(toolUses), autoContinuationAttempted)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
