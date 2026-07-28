@@ -329,13 +329,6 @@ func TestClaudeConversationIDStableFromAnchor(t *testing.T) {
 	if payloadA.ConversationState.ConversationID != payloadB.ConversationState.ConversationID {
 		t.Fatalf("expected stable conversation ID across turns, got %q vs %q", payloadA.ConversationState.ConversationID, payloadB.ConversationState.ConversationID)
 	}
-	if payloadA.ConversationState.AgentContinuationId != payloadB.ConversationState.AgentContinuationId {
-		t.Fatalf(
-			"expected stable agent continuation ID across turns, got %q vs %q",
-			payloadA.ConversationState.AgentContinuationId,
-			payloadB.ConversationState.AgentContinuationId,
-		)
-	}
 }
 
 func TestClaudeSessionMetadataStabilizesConversationAcrossPromptChanges(t *testing.T) {
@@ -361,9 +354,9 @@ func TestClaudeSessionMetadataStabilizesConversationAcrossPromptChanges(t *testi
 			second.ConversationState.ConversationID,
 		)
 	}
-	if first.ConversationState.AgentContinuationId != second.ConversationState.AgentContinuationId {
+	if first.ConversationState.AgentContinuationId == second.ConversationState.AgentContinuationId {
 		t.Fatalf(
-			"expected stable continuation ID for one Claude session, got %q and %q",
+			"expected per-request continuation IDs, got %q and %q",
 			first.ConversationState.AgentContinuationId,
 			second.ConversationState.AgentContinuationId,
 		)

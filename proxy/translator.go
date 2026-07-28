@@ -358,7 +358,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.ConversationID = buildClaudeConversationID(req, modelID, systemPrompt)
-	payload.ConversationState.AgentContinuationId = deriveAgentContinuationID(payload.ConversationState.ConversationID)
+	payload.ConversationState.AgentContinuationId = uuid.New().String()
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -2018,16 +2018,6 @@ func normalizeCanonicalUUID(value string) string {
 		return ""
 	}
 	return parsed.String()
-}
-
-func deriveAgentContinuationID(conversationID string) string {
-	if strings.TrimSpace(conversationID) == "" {
-		return uuid.New().String()
-	}
-	return uuid.NewSHA1(
-		uuid.NameSpaceURL,
-		[]byte("agent-continuation:"+conversationID),
-	).String()
 }
 
 func isSyntheticConversationAnchor(anchor string) bool {
